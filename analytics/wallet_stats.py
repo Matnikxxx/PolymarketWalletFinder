@@ -4,8 +4,9 @@ and derives the statistics needed for ranking/verification (spec sections
 3 and 22): ROI, win rate, drawdown, consistency, concentration, position
 count, average size, category mix, simultaneous-position tracking.
 
-This is a *read-only historical analysis* of a target wallet -- separate
-from trading/position_manager.py, which manages OUR paper positions.
+This is a *read-only historical analysis* of a target wallet -- it observes
+and derives statistics from a wallet's public activity feed only. It never
+manages positions, places orders, or runs paper-trading simulations.
 """
 from __future__ import annotations
 
