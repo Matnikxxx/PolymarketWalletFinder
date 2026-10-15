@@ -218,6 +218,41 @@ def test_new_event_tracked_and_duplicate_ignored(tmp_path):
     assert tracked2 == []
 
 
+def test_wallet_monitor_resilience_to_malformed_state_files(tmp_path):
+    """Confirm WalletMonitor initializes safely and appends to activity log even
+    if seen_events or activity_log files contain non-dict or non-list JSON."""
+    seen_file = tmp_path / "seen.json"
+    act_file = tmp_path / "activity.json"
+
+    # Corrupt or unexpected root types
+    seen_file.write_text("[]", encoding="utf-8")
+    act_file.write_text('{"bad_root": true}', encoding="utf-8")
+
+    fake = _FakeClient()
+    wallet = "0xrobust"
+    fake.activity[wallet] = [_raw_activity(wallet, "BUY", 0.5, 10, "m1", "t1", "s1", "tx-init", 1893456000)]
+
+    # Monitor must not crash on init
+    monitor = WalletMonitor(client=fake, seen_events_file=seen_file, activity_log_file=act_file)
+    assert monitor.baseline_done == {}
+    assert monitor.seen_ids == set()
+
+    # Baseline establish works cleanly
+    monitor.establish_baseline(wallet)
+    assert monitor.baseline_done.get(wallet) is True
+
+    # New event poll and append to previously non-list act_file works cleanly
+    fake.activity[wallet].append(_raw_activity(wallet, "BUY", 0.5, 10, "m1", "t1", "s1", "tx-new", 1893456100))
+    tracked = monitor.poll_wallet(wallet)
+    assert len(tracked) == 1
+
+    # Activity file is now a valid list with 1 entry
+    saved_act = json.loads(act_file.read_text(encoding="utf-8"))
+    assert isinstance(saved_act, list)
+    assert len(saved_act) == 1
+    assert saved_act[0]["event_id"] == "tx:tx-new"
+
+
 # ----------------------------------------------------------------------
 # 12-15. BUY / additional BUY / SELL / SELL activity is tracked in order
 # (formerly asserted OPENED/INCREASED/PARTIAL_EXIT/FULL_EXIT via

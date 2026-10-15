@@ -162,8 +162,12 @@ class WalletMonitor:
             activity_log_file if activity_log_file is not None else settings.WALLET_ACTIVITY_LOG_FILE
         )
         state = load_json(self.seen_events_file, default={"baseline_done": {}, "seen_ids": []})
-        self.baseline_done: dict[str, bool] = state.get("baseline_done", {})
-        self.seen_ids: set[str] = set(state.get("seen_ids", []))
+        if not isinstance(state, dict):
+            state = {}
+        raw_baseline = state.get("baseline_done")
+        self.baseline_done: dict[str, bool] = raw_baseline if isinstance(raw_baseline, dict) else {}
+        raw_seen = state.get("seen_ids")
+        self.seen_ids: set[str] = set(raw_seen) if isinstance(raw_seen, (list, set, tuple)) else set()
         # Live burst tracker (spec item 12). In-memory only, per run -- see
         # analytics.frequency.RollingWindowTracker for why that's safe.
         self.rapid_tracker = RollingWindowTracker()
@@ -178,6 +182,8 @@ class WalletMonitor:
         if not tracked:
             return
         existing = load_json(self.activity_log_file, default=[])
+        if not isinstance(existing, list):
+            existing = []
         existing.extend(t.as_dict() for t in tracked)
         save_json_atomic(self.activity_log_file, existing)
 
