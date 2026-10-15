@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="20">
+<title>Polymarket Wallet Finder Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #171a21;
+    --card-border: #262b36;
+    --text: #e8eaed;
+    --muted: #9aa4b2;
+    --green: #3ddc84;
+    --red: #ff6b6b;
+    --yellow: #ffcc4d;
+    --blue: #5b9dff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    margin: 0;
+    padding: 24px;
+    line-height: 1.4;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px 0; }
+  h2 { font-size: 16px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 32px 0 12px 0; }
+  .banner {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    background: var(--card); border: 1px solid var(--card-border);
+    border-radius: 10px; padding: 14px 18px; margin-bottom: 20px;
+  }
+  .pill {
+    display: inline-block; padding: 4px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 700; letter-spacing: 0.03em;
+  }
+  .pill-analysis { background: rgba(91,157,255,0.15); color: var(--blue); border: 1px solid var(--blue); }
+  .pill-disabled { background: rgba(255,107,107,0.12); color: var(--red); border: 1px solid var(--red); }
+  .muted { color: var(--muted); font-size: 13px; }
+  .refresh-link {
+    margin-left: auto; color: var(--blue); text-decoration: none; font-size: 13px;
+    border: 1px solid var(--card-border); padding: 6px 12px; border-radius: 6px;
+  }
+  .refresh-link:hover { border-color: var(--blue); }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-border); border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .card .value { font-size: 22px; font-weight: 700; }
+  .card .value.big { font-size: 28px; }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .na { color: var(--muted); font-style: italic; font-size: 15px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--card-border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .table-wrap { overflow-x: auto; background: var(--card); border: 1px solid var(--card-border); border-radius: 10px; }
+
+  .badge { padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; }
+  .badge-strong { background: rgba(61,220,132,0.18); color: var(--green); border: 1px solid var(--green); }
+  .badge-blue { background: rgba(91,157,255,0.15); color: var(--blue); border: 1px solid var(--blue); }
+  .badge-watch { background: rgba(255,204,77,0.15); color: var(--yellow); border: 1px solid var(--yellow); }
+  .badge-reject { background: rgba(255,107,107,0.12); color: var(--red); border: 1px solid var(--red); }
+  .badge-rec { background: rgba(61,220,132,0.18); color: var(--green); border: 1px solid var(--green); }
+  .badge-watch2 { background: rgba(255,204,77,0.15); color: var(--yellow); border: 1px solid var(--yellow); }
+  .badge-plain { background: rgba(154,164,178,0.15); color: var(--muted); border: 1px solid var(--card-border); }
+
+  .empty { padding: 24px; text-align: center; color: var(--muted); }
+  .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .section-caption { font-size: 12px; color: var(--muted); margin: -6px 0 10px 0; }
+  .top10-tag { font-size: 10px; background: var(--blue); color: #06121f; border-radius: 4px; padding: 1px 5px; margin-left: 6px; font-weight: 700; }
+
+  @media (max-width: 768px) {
+    body { padding: 14px; }
+    .banner { flex-direction: column; align-items: flex-start; }
+    .refresh-link { margin-left: 0; width: 100%; text-align: center; }
+    .cards { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  }
+</style>
+</head>
+<body>
+
+  <div class="banner">
+    <span class="pill pill-analysis">WALLET ANALYSIS</span>
+    <span class="pill pill-disabled">TRADING: DISABLED</span>
+    <span class="muted">Check interval: {{ data.discovery_status.check_interval_seconds }}s &middot;
+      Tracked wallets: {{ data.discovery_status.tracked_wallets }} &middot;
+      Discovered wallets: {{ data.discovery_status.discovered_wallets }}</span>
+    <a class="refresh-link" href="/">&#8635; Refresh</a>
+  </div>
+
+  <h1>Polymarket Wallet Finder Dashboard</h1>
+  <p class="muted">Read-only view of discovered/tracked wallet data. Auto-refreshes every 20s. This page never starts or stops wallet tracking -- run <code>python main.py --track-wallets</code> separately for that. This tool never places, simulates, or copies any trade.</p>
+
+  <!-- ============ TOP WALLET DETAILS ============ -->
+  <h2>Top Wallet Details <span class="section-caption">&mdash; the #1 ranked wallet from the table below</span></h2>
+  {% if data.top_wallet_details %}
+    {% set t = data.top_wallet_details %}
+    <div class="cards">
+      <div class="card"><div class="label">Wallet</div><div class="value" style="font-size:14px;" title="{{ t.wallet }}">{{ t.wallet[:16] }}...</div></div>
+      <div class="card"><div class="label">Total Trades</div><div class="value">{{ t.total_trades if t.total_trades is not none else "N/A" }}</div></div>
+      <div class="card"><div class="label">Volume</div><div class="value">{{ "$%.2f"|format(t.total_volume) if t.total_volume is not none else "N/A" }}</div></div>
+      <div class="card"><div class="label">Win Rate</div><div class="value">{{ "%.1f"|format(t.win_rate_pct) + "%" if t.win_rate_pct is not none else "N/A" }}</div></div>
+      <div class="card"><div class="label">ROI</div><div class="value {{ 'pos' if t.roi_pct is not none and t.roi_pct > 0 else ('neg' if t.roi_pct is not none and t.roi_pct < 0 else '') }}">{{ ("+" if t.roi_pct > 0 else "") + "%.1f"|format(t.roi_pct) + "%" if t.roi_pct is not none else "N/A" }}</div></div>
+      <div class="card"><div class="label">P&amp;L</div><div class="value {{ 'pos' if t.realized_pnl is not none and t.realized_pnl > 0 else ('neg' if t.realized_pnl is not none and t.realized_pnl < 0 else '') }}">{{ ("+$" if t.realized_pnl > 0 else ("-$" if t.realized_pnl < 0 else "$")) + "%.2f"|format(t.realized_pnl|abs) if t.realized_pnl is not none else "N/A" }}</div></div>
+      <div class="card"><div class="label">Drawdown</div><div class="value">{{ "-%.1f"|format(t.drawdown_pct) + "%" if t.drawdown_pct is not none and t.drawdown_pct > 0 else ("0.0%" if t.drawdown_pct == 0 else "N/A") }}</div></div>
+      <div class="card"><div class="label">Active Positions</div><div class="value">{{ t.active_positions if t.active_positions is not none else "N/A" }}</div></div>
+      <div class="card"><div class="label">Avg Trade Size</div><div class="value">{{ "$%.2f"|format(t.avg_position_size) if t.avg_position_size is not none else "N/A" }}</div></div>
+      <div class="card"><div class="label">Last Trade</div><div class="value" style="font-size:14px;">{{ t.last_activity_at or "N/A" }}</div></div>
+    </div>
+    <p class="note">Data quality: {{ t.data_quality }} -- {{ t.data_quality_reason or "no details available" }}</p>
+  {% else %}
+    <div class="table-wrap empty">No wallets scanned yet. Run <code>python main.py --scan-wallets</code>.</div>
+  {% endif %}
+
+  <!-- ============ TRACKED WALLETS ============ -->
+  <h2>Tracked Wallets <span class="section-caption">&mdash; wallets <code>--track-wallets</code> actively polls for new activity</span></h2>
+  <div class="table-wrap">
+  {% if data.tracked_wallet_table %}
+    <table>
+      <thead><tr><th>#</th><th>Wallet</th><th>Score</th><th>Recommendation</th><th>Frequency</th><th>Status</th></tr></thead>
+      <tbody>
+      {% for w in data.tracked_wallet_table %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td>{{ w.wallet[:14] }}...</td>
+          <td>{{ "%.1f"|format(w.score) if w.score is not none else "N/A" }}</td>
+          <td>
+            {% if w.recommendation == "RECOMMENDED" %}<span class="badge badge-rec">RECOMMENDED</span>
+            {% elif w.recommendation == "WATCH" %}<span class="badge badge-watch2">WATCH</span>
+            {% elif w.recommendation == "REJECT" %}<span class="badge badge-reject">REJECT</span>
+            {% else %}<span class="badge badge-plain">{{ w.recommendation or "N/A" }}</span>{% endif %}
+          </td>
+          <td>{{ w.frequency_classification or "N/A" }}</td>
+          <td><span class="badge badge-plain">Tracked</span></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <div class="empty">No wallets are tracked. Edit data/wallets.json ("tracked": true) to start tracking one.</div>
+  {% endif %}
+  </div>
+  <p class="note">"Tracked" means <code>python main.py --track-wallets</code> will poll this wallet for new activity whenever running as a separate process -- this dashboard does not start or stop that process.</p>
+
+  <!-- ============ WALLET RANKING ============ -->
+  <h2>Wallet Ranking <span class="section-caption">&mdash; ALL scanned/ranked candidates (not automatically tracked)</span></h2>
+  <div class="table-wrap">
+  {% if data.wallet_table %}
+    <table>
+      <thead><tr>
+        <th>Rank</th><th>Wallet</th><th>Score</th><th>Recommendation</th><th>Win Rate</th><th>ROI</th>
+        <th>P&amp;L</th><th>Drawdown</th><th>Positions</th><th>Avg Size</th><th>Risk</th><th>Frequency</th><th>Data Quality</th><th>Tracked?</th>
+      </tr></thead>
+      <tbody>
+      {% for w in data.wallet_table %}
+        <tr>
+          <td>{{ loop.index }}{% if loop.index <= 10 %}<span class="top10-tag">TOP 10</span>{% endif %}</td>
+          <td title="{{ w.wallet }}">{{ w.wallet[:14] }}...</td>
+          <td>{{ "%.1f"|format(w.score) if w.score is not none else "N/A" }}</td>
+          <td>
+            {% if w.recommendation == "RECOMMENDED" %}<span class="badge badge-rec">RECOMMENDED</span>
+            {% elif w.recommendation == "WATCH" %}<span class="badge badge-watch2">WATCH</span>
+            {% elif w.recommendation == "REJECT" %}<span class="badge badge-reject">REJECT</span>
+            {% else %}<span class="badge badge-plain">{{ w.recommendation or "N/A" }}</span>{% endif %}
+          </td>
+          <td>{{ "%.1f"|format(w.win_rate_pct) + "%" if w.win_rate_pct is not none else "N/A" }}</td>
+          <td class="{{ 'pos' if w.roi_pct is not none and w.roi_pct > 0 else ('neg' if w.roi_pct is not none and w.roi_pct < 0 else '') }}">
+            {{ ("+" if w.roi_pct > 0 else "") + "%.1f"|format(w.roi_pct) + "%" if w.roi_pct is not none else "N/A" }}
+          </td>
+          <td class="{{ 'pos' if w.realized_pnl is not none and w.realized_pnl > 0 else ('neg' if w.realized_pnl is not none and w.realized_pnl < 0 else '') }}">
+            {{ ("+$" if w.realized_pnl > 0 else ("-$" if w.realized_pnl < 0 else "$")) + "%.2f"|format(w.realized_pnl|abs) if w.realized_pnl is not none else "N/A" }}
+          </td>
+          <td>{{ "-%.1f"|format(w.drawdown_pct) + "%" if w.drawdown_pct is not none and w.drawdown_pct > 0 else ("0.0%" if w.drawdown_pct == 0 else "N/A") }}</td>
+          <td>{{ w.num_positions if w.num_positions is not none else "N/A" }}</td>
+          <td>{{ "$%.2f"|format(w.avg_position_size) if w.avg_position_size is not none else "N/A" }}</td>
+          <td>{{ "%.1f"|format(w.risk_score) if w.risk_score is not none else "N/A" }}</td>
+          <td>
+            {% if w.frequency_classification %}
+              {% set freq_tip = "raw fills: " + (w.frequency_raw_fill_count|string if w.frequency_raw_fill_count is not none else "?") + ", logical trades: " + (w.frequency_logical_trades|string if w.frequency_logical_trades is not none else "?") + ", max in 60s: " + (w.frequency_max_trades_60s|string if w.frequency_max_trades_60s is not none else "?") + " (rule: >=5), gaps<=10s: " + (w.frequency_pct_gaps_le_10s|string if w.frequency_pct_gaps_le_10s is not none else "?") + "% (rule: >=30%)" %}
+              {% if w.frequency_classification == "BOT_LIKE" %}<span class="badge badge-reject" title="{{ freq_tip }}">BOT_LIKE</span>
+              {% elif w.frequency_classification == "RAPID_TRADER" %}<span class="badge badge-watch2" title="{{ freq_tip }}">RAPID_TRADER</span>
+              {% elif w.frequency_classification == "HIGH_FREQUENCY" %}<span class="badge badge-watch2" title="{{ freq_tip }}">HIGH_FREQUENCY</span>
+              {% else %}<span class="badge badge-plain" title="{{ freq_tip }}">{{ w.frequency_classification }}</span>{% endif %}
+            {% else %}N/A{% endif %}
+          </td>
+          <td>
+            {% if w.data_quality == "FULL" %}<span class="badge badge-rec" title="{{ w.data_quality_reason }}">Full</span>
+            {% elif w.data_quality == "ACTIVITY_ONLY" %}<span class="badge badge-blue" title="{{ w.data_quality_reason }}">Activity only</span>
+            {% elif w.data_quality == "PARTIAL" %}<span class="badge badge-watch2" title="{{ w.data_quality_reason }}">Partial</span>
+            {% elif w.data_quality == "API_UNAVAILABLE" %}<span class="badge badge-reject" title="{{ w.data_quality_reason }}">API unavailable</span>
+            {% else %}<span class="badge badge-plain" title="{{ w.data_quality_reason }}">Insufficient data</span>{% endif %}
+          </td>
+          <td>{{ "Yes" if w.tracked else "No" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <div class="empty">No wallets scanned yet. Run <code>python main.py --scan-wallets</code>.</div>
+  {% endif %}
+  </div>
+  <p class="note">This is the scanned/ranked candidate pool, not the set of wallets being tracked. Only wallets marked "Tracked: Yes" above (and listed in the Tracked Wallets section) are ever polled by <code>--track-wallets</code>.</p>
+
+  <!-- ============ RECENT WALLET ACTIVITY ============ -->
+  <h2>Recent Wallet Activity <span class="section-caption">&mdash; new BUY/SELL activity observed on tracked wallets</span></h2>
+  <div class="table-wrap">
+  {% if data.recent_activity %}
+    <table>
+      <thead><tr>
+        <th>Detected At</th><th>Wallet</th><th>Market</th><th>Side</th><th>Price</th>
+        <th>Size</th><th>USDC Size</th><th>Category</th><th>Rapid?</th>
+      </tr></thead>
+      <tbody>
+      {% for a in data.recent_activity %}
+        <tr>
+          <td>{{ a.detected_at }}</td>
+          <td>{{ (a.wallet or "?")[:10] }}...</td>
+          <td>{{ a.market or "?" }}</td>
+          <td>{{ a.side }}</td>
+          <td>{{ a.price }}</td>
+          <td>{{ a.size }}</td>
+          <td>{{ a.usdc_size }}</td>
+          <td>{{ a.category }}</td>
+          <td>
+            {% if a.is_rapid %}<span class="badge badge-watch2" title="{{ a.rapid_reason }}">RAPID</span>
+            {% else %}<span class="badge badge-plain">normal</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <div class="empty">No activity tracked yet. Set a wallet to "tracked": true in data/wallets.json and run <code>python main.py --track-wallets</code>.</div>
+  {% endif %}
+  </div>
+
+</body>
+</html>
