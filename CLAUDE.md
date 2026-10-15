@@ -31,6 +31,16 @@ wallets the user explicitly chooses to track.
 - For compatibility, old configuration entries with `enabled` are still read when
   `tracked` is absent. New writes should use `tracked`.
 - Do not discard existing user selections or history during migrations.
+- `--scan-wallets` merges into the stored config (case-insensitive address
+  matching, custom fields and `tracked` preserved, undiscovered wallets kept);
+  it must never rebuild the file from scratch.
+- Discovery pagination: `LEADERBOARD_PAGE_SIZE` (max 50) and
+  `MAX_LEADERBOARD_PAGES` bound the leaderboard walk; `MAX_WALLET_CANDIDATES`
+  caps the combined leaderboard + seed pool.
+- Stale-data rule: a failed refresh must never overwrite stored metrics or
+  scores. It sets `data_quality="STALE"`, `hard_filter_status="STALE"`, updates
+  `last_refresh_attempt`, leaves `last_successful_refresh` untouched, and bars
+  the wallet from ranking. A *successful empty* response is not stale.
 - Do not commit `.env`, credentials, local logs, or user data.
 
 ## Change workflow

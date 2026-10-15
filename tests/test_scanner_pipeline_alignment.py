@@ -313,7 +313,7 @@ def test_cmd_scan_wallets_multi_partitioning(
     mock_client = MagicMock()
     mock_client_cls.return_value = mock_client
 
-    def side_effect_events(client, wallet, max_pages=5):
+    def side_effect_events(client, wallet, max_pages=5, **_kwargs):
         if wallet == w_pass:
             return [
                 {
@@ -345,7 +345,7 @@ def test_cmd_scan_wallets_multi_partitioning(
     mock_events.side_effect = side_effect_events
 
     # cmd_scan_wallets now calls get_wallet_closed_positions_paginated (Phase 12).
-    def side_effect_closed_paginated(wallet, max_pages=5):
+    def side_effect_closed_paginated(wallet, max_pages=5, **_kwargs):
         if wallet == w_pass:
             return [
                 {

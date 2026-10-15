@@ -76,6 +76,7 @@ def fetch_wallet_events_paginated(
     wallet: str,
     max_pages: int = 5,
     page_size: int = 100,
+    raise_on_error: bool = False,
 ) -> list[dict]:
     """
     Fetch and normalize a wallet's complete TRADE activity across up to
@@ -88,6 +89,12 @@ def fetch_wallet_events_paginated(
     Returns events sorted oldest-first (ascending timestamp), deduplicated
     by event_id so that duplicate fills from overlapping page windows never
     produce duplicate PositionRecords downstream.
+
+    `raise_on_error=False` (default) keeps the historical best-effort
+    behaviour: a failed page ends pagination and the events collected so far
+    are returned. Pass ``raise_on_error=True`` to surface the failure as an
+    ``ApiError`` instead, so callers can distinguish "no activity" from "the
+    request failed" (Phase B stale-data handling).
     """
     from config.settings import settings
     max_pages = max(1, max_pages)
@@ -98,6 +105,8 @@ def fetch_wallet_events_paginated(
         try:
             raw_page = client.get_wallet_activity(wallet, limit=page_size, offset=offset)
         except ApiError:
+            if raise_on_error:
+                raise
             break
         if not raw_page:
             break

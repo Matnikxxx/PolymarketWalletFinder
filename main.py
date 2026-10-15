@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import datetime, timezone
 
 from config.settings import settings
 from polymarket.api_client import PolymarketApiClient, ApiError
@@ -32,7 +33,14 @@ from filters.wallet_filter import filter_wallet, WalletFilterResult
 from wallet.ranking import rank_wallets
 from wallet.scanner import scan_top_wallets
 from wallet.verifier import verify_wallet
-from wallet.monitor import WalletMonitor, load_wallet_config, save_wallet_config, tracked_wallets
+from wallet.monitor import (
+    WalletMonitor,
+    load_wallet_config,
+    merge_wallet_records,
+    save_wallet_config,
+    tracked_wallets,
+    wallet_address_key,
+)
 from monitor.status import print_wallet_ranking, print_verification, print_dashboard, print_wallet_report
 from analytics.dashboard import build_dashboard_data
 
@@ -49,38 +57,197 @@ def setup_logging() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase B: fresh-vs-stale scan bookkeeping
+# ---------------------------------------------------------------------------
+
+# Value written to data_quality / hard_filter_status when a refresh could not
+# be completed. Deliberately distinct from the Phase 6 retrieval_status
+# values (SUFFICIENT / PARTIAL / INSUFFICIENT) and from the legacy
+# DataQuality constants: "we could not look" is not the same statement as
+# "the wallet has no history".
+DATA_QUALITY_STALE = "STALE"
+
+# Historical performance / ranking / diagnostic fields that a scan must NOT
+# overwrite when a refresh is incomplete. A failed request means we could not
+# observe the wallet this time -- it says nothing about the wallet's history,
+# so whatever the last successful refresh stored stays exactly as it was.
+PRESERVED_ON_INCOMPLETE_REFRESH = (
+    "last_score",
+    "recommendation",
+    "win_rate_pct",
+    "roi_pct",
+    "drawdown_pct",
+    "realized_pnl",
+    "num_positions",
+    "avg_position_size",
+    "risk_score",
+    "consistency_score",
+    "frequency_classification",
+    "frequency_median_gap_seconds",
+    "frequency_raw_fill_count",
+    "frequency_logical_trades",
+    "frequency_max_trades_60s",
+    "frequency_pct_gaps_le_10s",
+    "frequency_rule_5_trades_60s",
+    "frequency_rule_30pct_gaps_le_10s",
+    "total_trades",
+    "buy_trades",
+    "sell_trades",
+    "total_volume",
+    "largest_trade",
+    "active_positions",
+    "portfolio_value",
+    "last_activity_at",
+)
+
+
+def _utc_now_iso() -> str:
+    """UTC timestamp for last_refresh_attempt / last_successful_refresh."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _stale_wallet_update(
+    wallet: str, previous: dict, attempted_at: str, reason: str
+) -> dict:
+    """
+    Build the wallets.json update for a wallet whose refresh failed (Phase B,
+    section C).
+
+    Every performance-related field is carried over from `previous` verbatim
+    (None when the wallet has no successful history yet); only the freshness
+    and data-quality fields change. `last_successful_refresh` is deliberately
+    left untouched, so a failed request can never look like a successful one,
+    and `pnl_source` is never reset to a source that implies fresh data.
+    """
+    previous = previous if isinstance(previous, dict) else {}
+    update = {field: previous.get(field) for field in PRESERVED_ON_INCOMPLETE_REFRESH}
+    update["wallet"] = wallet
+    update["data_quality"] = DATA_QUALITY_STALE
+    update["data_quality_reason"] = reason
+    update["hard_filter_status"] = DATA_QUALITY_STALE
+    update["hard_filter_reasons"] = [reason]
+    update["hard_filter_insufficient_criteria"] = list(
+        previous.get("hard_filter_insufficient_criteria") or []
+    )
+    update["last_refresh_attempt"] = attempted_at
+    update["last_successful_refresh"] = previous.get("last_successful_refresh")
+    # `pnl_source` describes where the RETAINED numbers came from; when there
+    # is no retained history it stays "none" -- a failed request is never a
+    # source of P&L data.
+    update["pnl_source"] = previous.get("pnl_source") or "none"
+    if not update.get("recommendation"):
+        update["recommendation"] = "DATA_STALE"
+    return update
+
+
+def _fresh_data_quality(stats, closed_rows_returned: bool) -> tuple[str, str, str]:
+    """
+    Honest ``(data_quality, data_quality_reason, pnl_source)`` for a wallet
+    whose closed-positions refresh SUCCEEDED.
+
+    ``closed_rows_returned`` is False when the request succeeded but the
+    history was empty. That is a genuine, fresh "no closed positions" answer
+    -- never STALE, because the request itself did work -- but it is also not
+    authoritative performance history: any numbers that exist in that case
+    come from build_position_records()'s activity-reconstruction fallback and
+    are labelled as such instead of being presented as closed-position
+    accounting. A wallet with no eligible positions at all publishes no
+    ROI/win-rate/P&L.
+    """
+    counted = stats.positions_counted
+    if counted <= 0:
+        return (
+            stats.retrieval_status,
+            "Closed-positions request succeeded but returned no eligible closed positions; "
+            "no ROI, win rate or realized P&L is published from an empty history.",
+            "none",
+        )
+    if not closed_rows_returned:
+        return (
+            "ACTIVITY_ONLY",
+            f"Closed-positions API returned an empty history; the {counted} eligible position(s) "
+            "were reconstructed from /activity fills, so ROI/win-rate/realized P&L are our own "
+            "reconstruction rather than authoritative closed-position accounting.",
+            "activity_reconstruction",
+        )
+    return (
+        stats.retrieval_status,
+        f"Win/loss, realized P&L, ROI, and drawdown computed from "
+        f"{counted} eligible position(s) via Phase 6 engine.",
+        "closed_positions_api",
+    )
+
+
 def cmd_scan_wallets(args) -> None:
     client = PolymarketApiClient()
     wallets = scan_top_wallets(client, limit=settings.MAX_WALLET_CANDIDATES)
+    refresh_attempt_at = _utc_now_iso()
+
+    # Existing records are loaded BEFORE anything is written, so a scan can
+    # merge into them instead of rebuilding the file: tracked preferences,
+    # hand-added wallets, custom fields and wallets that simply did not
+    # reappear on the leaderboard this time all survive a re-scan.
+    existing_records = load_wallet_config()
+    existing_by_key: dict[str, dict] = {}
+    for record in existing_records:
+        key = wallet_address_key(record)
+        if key and key not in existing_by_key:
+            existing_by_key[key] = record
 
     stats_map = {}
     freq_map = {}
     diag_map = {}
     filter_map = {}
     extra_details = {}
+    endpoint_notes_map: dict[str, list[str]] = {}
+    closed_rows_returned_map: dict[str, bool] = {}
+    stale_updates: dict[str, dict] = {}
+    stale_wallets: list[str] = []
+
     for w in wallets:
         short = w[:10] + "..."
         # Phase 12: paginate activity and closed-positions so that recent sell
         # events overlap with the closed-position records, allowing accurate
         # TRADING_EXIT classification in build_position_records().
-        events = fetch_wallet_events_paginated(
-            client, w, max_pages=settings.MAX_HISTORY_PAGES
-        )
-
-        # --- authoritative closed-position P&L/win-rate --------------------
-        raw_closed = []
+        # Phase B: raise_on_error=True makes "the request failed" tellable
+        # apart from "the response was genuinely empty". Both endpoints are
+        # material to the P&L metrics AND to the hard filter (TRADING_EXIT
+        # detection drives is_resolution_only), so a failure must never be
+        # silently treated as fresh data.
+        stale_reasons: list[str] = []
+        events = []
         try:
-            raw_closed = client.get_wallet_closed_positions_paginated(
-                w, max_pages=settings.MAX_HISTORY_PAGES
+            events = fetch_wallet_events_paginated(
+                client, w, max_pages=settings.MAX_HISTORY_PAGES, raise_on_error=True
             )
         except ApiError as exc:
+            stale_reasons.append(f"/activity request failed: {exc}")
+            logger.warning("WALLET_STATS_PARTIAL wallet=%s reason=activity_api_failed:%s", short, exc)
+
+        # --- authoritative closed-position P&L/win-rate --------------------
+        raw_closed: list[dict] = []
+        try:
+            raw_closed = client.get_wallet_closed_positions_paginated(
+                w, max_pages=settings.MAX_HISTORY_PAGES, raise_on_error=True
+            )
+        except ApiError as exc:
+            stale_reasons.append(f"/closed-positions request failed: {exc}")
+            logger.warning("WALLET_STATS_PARTIAL wallet=%s reason=closed_positions_api_failed:%s", short, exc)
+        except Exception as exc:  # defensive: a bad wallet must not kill the scan
+            stale_reasons.append(f"/closed-positions request failed: {exc}")
             logger.warning("WALLET_STATS_PARTIAL wallet=%s reason=closed_positions_api_failed:%s", short, exc)
 
         # --- active open positions ------------------------------------------
+        # Not material to ROI/win-rate/P&L (those come from closed positions),
+        # so a failure here is recorded as a note rather than invalidating the
+        # whole refresh.
+        endpoint_notes: list[str] = []
         raw_positions = []
         try:
             raw_positions = client.get_wallet_positions(w)
         except ApiError as exc:
+            endpoint_notes.append("(/positions request failed this scan; open-position fields are null.)")
             logger.warning("WALLET_STATS_PARTIAL wallet=%s reason=positions_api_failed:%s", short, exc)
 
         # --- portfolio value -------------------------------------------------
@@ -88,12 +255,17 @@ def cmd_scan_wallets(args) -> None:
         try:
             portfolio_val = client.get_wallet_value(w)
         except ApiError as exc:
+            endpoint_notes.append("(/value request failed this scan; portfolio value is null.)")
             logger.warning("WALLET_STATS_PARTIAL wallet=%s reason=value_api_failed:%s", short, exc)
+        endpoint_notes_map[w] = endpoint_notes
+        closed_rows_returned_map[w] = bool(raw_closed)
 
         # Build canonical Phase 6 PositionRecords
         positions = build_position_records(raw_closed, events, raw_positions)
 
-        # Compute canonical Phase 6 WalletStatistics
+        # Compute canonical Phase 6 WalletStatistics. These are computed on
+        # every scan for diagnostics, but are only PERSISTED for a refresh
+        # that actually succeeded -- see the stale branch below.
         stats = compute_wallet_statistics(w, positions)
         stats_map[w] = stats
 
@@ -141,6 +313,30 @@ def cmd_scan_wallets(args) -> None:
             "portfolio_value": portfolio_val,
         }
 
+        if stale_reasons:
+            # Phase B (section C): the refresh failed. This scan's data is
+            # STALE: no metric is recomputed from it, the last successful
+            # refresh's metrics/scores/recommendation are carried over
+            # untouched, and the wallet is barred from a fresh PASS/ranking.
+            reason = (
+                "Refresh incomplete: " + "; ".join(stale_reasons) + ". "
+                "Previously stored performance metrics, scores and recommendations were "
+                "retained unchanged; this scan's data is STALE and cannot qualify as a fresh PASS."
+            )
+            stale_updates[w] = _stale_wallet_update(
+                w, existing_by_key.get(w, {}), refresh_attempt_at, reason
+            )
+            stale_wallets.append(w)
+            filter_map[w] = WalletFilterResult(
+                passed=False,
+                reasons=[reason],
+                status=DATA_QUALITY_STALE,
+                insufficient_criteria=[],
+            )
+            print(f"HARD_FILTER_STALE wallet={short}")
+            logger.warning("HARD_FILTER_STALE wallet=%s reasons=%s", short, "; ".join(stale_reasons))
+            continue
+
         # --- Phase 8C & 10: Hard-filter gate on canonical WalletStatistics ---
         filter_result = filter_wallet(stats)
         if filter_result.status == "FAIL":
@@ -167,7 +363,8 @@ def cmd_scan_wallets(args) -> None:
 
         filter_map[w] = filter_result
 
-    # Wallets that hard-failed are excluded from the ranking/recommendation pool.
+    # Wallets that hard-failed, lacked data, or could not be refreshed are
+    # excluded from the ranking/recommendation pool.
     pass_wallets = [
         w for w in wallets
         if filter_map[w].status == "PASS"
@@ -182,27 +379,29 @@ def cmd_scan_wallets(args) -> None:
     ]
 
     logger.info(
-        "HARD_FILTER_SUMMARY pass=%d insufficient=%d fail=%d total=%d",
-        len(pass_wallets), len(insufficient_wallets), len(fail_wallets), len(wallets),
+        "HARD_FILTER_SUMMARY pass=%d insufficient=%d fail=%d stale=%d total=%d",
+        len(pass_wallets), len(insufficient_wallets), len(fail_wallets),
+        len(stale_wallets), len(wallets),
     )
 
-    # Canonical Phase 10 ranking: pass_stats are WalletStatistics, pass_freq are FrequencyProfile
+    # Canonical Phase 10 ranking: only wallets with FRESH data that passed the
+    # hard filter enter the pool; STALE wallets keep their previous score.
     pass_stats = [stats_map[w] for w in pass_wallets]
     pass_freq = {w: freq_map[w] for w in pass_wallets}
     cards = rank_wallets(pass_stats, pass_freq)
     print_wallet_ranking(cards)
 
-    existing = {w["wallet"].lower(): w for w in load_wallet_config()}
-    new_config = []
+    updates: list[dict] = []
 
     # --- Ranked (PASS) wallets -------------------------------------------
     for card in cards:
         stats = stats_map[card.wallet]
         extra = extra_details.get(card.wallet, {})
-        cfg = existing.get(card.wallet, {"wallet": card.wallet, "tracked": False})
-        if "tracked" not in cfg:
-            cfg["tracked"] = bool(cfg.get("enabled", False))
-        cfg.pop("enabled", None)
+        cfg = {
+            "wallet": card.wallet,
+            "last_refresh_attempt": refresh_attempt_at,
+            "last_successful_refresh": refresh_attempt_at,
+        }
         cfg["last_score"] = card.final_score
         cfg["recommendation"] = card.recommendation
         cfg["frequency_classification"] = card.frequency_classification
@@ -223,9 +422,14 @@ def cmd_scan_wallets(args) -> None:
         cfg["hard_filter_insufficient_criteria"] = fres.insufficient_criteria if fres else []
 
         has_closed_data = stats.positions_counted > 0
-        cfg["data_quality"] = stats.retrieval_status
-        cfg["data_quality_reason"] = f"Win/loss, realized P&L, ROI, and drawdown computed from {stats.positions_counted} eligible position(s) via Phase 6 engine."
-        cfg["pnl_source"] = "closed_positions_api"
+        data_quality, quality_reason, pnl_source = _fresh_data_quality(
+            stats, closed_rows_returned_map.get(card.wallet, False)
+        )
+        cfg["data_quality"] = data_quality
+        cfg["data_quality_reason"] = quality_reason
+        cfg["pnl_source"] = pnl_source
+        if endpoint_notes_map.get(card.wallet):
+            cfg["data_quality_reason"] += " " + " ".join(endpoint_notes_map[card.wallet])
         cfg["win_rate_pct"] = stats.win_rate_pct if has_closed_data else None
         cfg["roi_pct"] = stats.roi_fee_exclusive_pct if has_closed_data else None
         cfg["drawdown_pct"] = stats.drawdown_cost_pct if has_closed_data else None
@@ -242,33 +446,48 @@ def cmd_scan_wallets(args) -> None:
         cfg["active_positions"] = extra.get("active_positions")
         cfg["portfolio_value"] = extra.get("portfolio_value")
         cfg["last_activity_at"] = stats.last_activity_at
-        new_config.append(cfg)
+        updates.append(cfg)
 
     # --- FAIL and INSUFFICIENT_DATA wallets (not ranked) -----------------
     for w in fail_wallets + insufficient_wallets:
         stats = stats_map[w]
         fres = filter_map[w]
         extra = extra_details.get(w, {})
-        cfg = existing.get(w, {"wallet": w, "tracked": False})
-        if "tracked" not in cfg:
-            cfg["tracked"] = bool(cfg.get("enabled", False))
-        cfg.pop("enabled", None)
+        cfg = {
+            "wallet": w,
+            "last_refresh_attempt": refresh_attempt_at,
+            "last_successful_refresh": refresh_attempt_at,
+        }
         cfg["last_score"] = None
         cfg["recommendation"] = "HARD_FILTER_REJECT" if fres.status == "FAIL" else "HARD_FILTER_INSUFFICIENT_DATA"
         cfg["hard_filter_status"] = fres.status
         cfg["hard_filter_reasons"] = fres.reasons
         cfg["hard_filter_insufficient_criteria"] = fres.insufficient_criteria
         has_closed_data = stats.positions_counted > 0
-        cfg["data_quality"] = stats.retrieval_status
-        cfg["data_quality_reason"] = f"Win/loss, realized P&L, ROI, and drawdown computed from {stats.positions_counted} eligible position(s) via Phase 6 engine."
-        cfg["pnl_source"] = "closed_positions_api"
+        data_quality, quality_reason, pnl_source = _fresh_data_quality(
+            stats, closed_rows_returned_map.get(w, False)
+        )
+        cfg["data_quality"] = data_quality
+        cfg["data_quality_reason"] = quality_reason
+        cfg["pnl_source"] = pnl_source
+        if endpoint_notes_map.get(w):
+            cfg["data_quality_reason"] += " " + " ".join(endpoint_notes_map[w])
         cfg["win_rate_pct"] = stats.win_rate_pct if has_closed_data else None
         cfg["roi_pct"] = stats.roi_fee_exclusive_pct if has_closed_data else None
         cfg["last_activity_at"] = stats.last_activity_at
-        new_config.append(cfg)
+        updates.append(cfg)
 
-    save_wallet_config(new_config)
-    print(f"\nSaved {len(new_config)} candidate wallets to {settings.WALLETS_FILE}")
+    # --- STALE wallets: previous metrics preserved, never overwritten -----
+    for w in stale_wallets:
+        updates.append(stale_updates[w])
+
+    # Merge into the stored configuration: matching is case-insensitive, the
+    # stored `tracked` selection and any custom fields survive, and wallets
+    # that were not rediscovered are retained unchanged.
+    merged_records = merge_wallet_records(existing_records, updates)
+    save_wallet_config(merged_records)
+    retained = max(0, len(merged_records) - len(updates))
+    print(f"\nSaved {len(merged_records)} wallet records to {settings.WALLETS_FILE}")
     print(
         f"  {len(cards)} passed hard filter and were ranked."
     )
@@ -276,10 +495,17 @@ def cmd_scan_wallets(args) -> None:
         print(f"  {len(fail_wallets)} rejected by hard filter (see hard_filter_status=FAIL).")
     if insufficient_wallets:
         print(f"  {len(insufficient_wallets)} have insufficient data for full filtering.")
+    if stale_wallets:
+        print(
+            f"  {len(stale_wallets)} could not be refreshed (hard_filter_status=STALE); "
+            "previously stored metrics kept."
+        )
+    if retained:
+        print(f"  {retained} previously stored wallet(s) were not rediscovered and were kept unchanged.")
     print("Set \"tracked\": true for any wallet you want to track.")
     print(
-        f"(Candidate pool is currently ~{len(wallets)} wallets -- see "
-        "MAX_WALLET_CANDIDATES in .env / wallet/scanner.py's docstring for why.)"
+        f"(Candidate pool was {len(wallets)} wallet(s) this scan -- capped by "
+        "MAX_WALLET_CANDIDATES and paged via LEADERBOARD_PAGE_SIZE / MAX_LEADERBOARD_PAGES in .env.)"
     )
 
 

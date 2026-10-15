@@ -247,10 +247,19 @@ class PolymarketApiClient:
         page_size: int = 50,
         sort_by: str = "TIMESTAMP",
         sort_direction: str = "DESC",
+        raise_on_error: bool = False,
     ) -> list[dict]:
         """
         Retrieve the wallet's full closed-position history across up to
         `max_pages` pages (Phase 12).
+
+        `raise_on_error=False` (default) keeps the historical best-effort
+        behaviour: a failing page ends pagination and whatever was already
+        collected is returned. Pass ``raise_on_error=True`` to surface the
+        failure as an ``ApiError`` instead, so callers can distinguish "the
+        history is empty" from "the request failed" -- Phase B's stale-data
+        handling needs that distinction and must never treat a failed
+        request as fresh (empty) data.
 
         Uses offset-based pagination.  Stops early when a page returns fewer
         records than page_size (no more data) or when max_pages is reached
@@ -273,7 +282,15 @@ class PolymarketApiClient:
                     wallet, limit=page_size, offset=offset,
                     sort_by=sort_by, sort_direction=sort_direction,
                 )
-            except Exception:
+            except ApiError:
+                if raise_on_error:
+                    raise
+                break
+            except Exception as exc:
+                if raise_on_error:
+                    raise ApiError(
+                        f"closed-positions pagination failed for wallet={wallet} offset={offset}: {exc}"
+                    ) from exc
                 break
             if not page_data:
                 break

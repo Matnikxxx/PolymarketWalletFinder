@@ -16,10 +16,11 @@ anywhere in this codebase and no order-placement code path.
 
 ## 1. What this tool does
 
-1. Scans/ranks candidate wallets from Polymarket's public leaderboard (plus
-   a seed list) and scores them transparently (ROI, win rate, drawdown,
-   consistency, concentration, category mix, trading-frequency cadence --
-   with a written reason for every point).
+1. Scans/ranks candidate wallets from Polymarket's public leaderboard (walked
+   with bounded `limit`/`offset` pagination, plus a seed list) and scores them
+   transparently (ROI, win rate, drawdown, consistency, concentration,
+   category mix, trading-frequency cadence -- with a written reason for every
+   point).
 2. Lets you **manually** mark specific wallets as tracked in
    `data/wallets.json`. Nothing is tracked automatically just because it
    was scanned.
@@ -173,6 +174,72 @@ Phase 7 frequency analysis (`analytics/frequency_models.py`, `analytics/frequenc
 
 ---
 
+## 5e. Wallet discovery: pagination, validation and merge behaviour
+
+`--scan-wallets` builds its candidate pool like this:
+
+- The public leaderboard (`GET /v1/leaderboard`) is walked with
+  `limit`/`offset` pages: `LEADERBOARD_PAGE_SIZE` rows per page (hard ceiling
+  50, enforced by the scanner regardless of configuration) for at most
+  `MAX_LEADERBOARD_PAGES` requests.
+- Pagination stops as soon as: the page cap is reached, an empty page comes
+  back, a short page comes back (fewer rows than requested = leaderboard
+  exhausted), a page repeats a page already seen, an API request fails, or
+  `MAX_WALLET_CANDIDATES` candidates have been collected. Attempted requests
+  are counted, including the one that failed, and the loop is bounded by the
+  page cap so it can never spin.
+- Every address is validated against `^0x[a-fA-F0-9]{40}$` and normalized to
+  lowercase. Rows that fail validation are skipped individually (and counted)
+  -- one malformed row never aborts a scan.
+- Candidates are de-duplicated globally across pages and against the seed
+  list, leaderboard ordering is preserved, and valid seeds are appended
+  afterwards. The overall `MAX_WALLET_CANDIDATES` cap covers the union.
+- A healthy leaderboard therefore fills the pool on its own by default; seeds
+  matter when the leaderboard is short/unavailable or when the cap is raised.
+  Seed wallets that were already stored in `data/wallets.json` are never lost
+  either way -- see below.
+
+`--scan-wallets` **merges** into `data/wallets.json`, it never rebuilds it:
+
+- Matching is case-insensitive on the normalized address, so casing can never
+  create a duplicate record.
+- Fields a user added by hand are preserved; fresh scan values overwrite
+  stale ones.
+- The stored `tracked` selection always wins (the legacy `enabled` field is
+  honoured when `tracked` is absent and rewritten as `tracked`).
+- Wallets that were not rediscovered -- including manually added ones -- are
+  retained unchanged, in their original order. **A scan never deletes a
+  wallet because it dropped off the leaderboard.**
+
+### Data freshness in `data/wallets.json`
+
+Each scanned record carries:
+
+| Field | Meaning |
+| --- | --- |
+| `last_refresh_attempt` | When this scan tried to refresh the wallet (always updated, success or failure). |
+| `last_successful_refresh` | When the last *successful* closed-positions refresh happened (unchanged by a failed request). |
+| `data_quality` | `SUFFICIENT`, `PARTIAL`, `INSUFFICIENT`, `ACTIVITY_ONLY` or `STALE` -- see below. |
+| `data_quality_reason` | Human-readable explanation of the value above. |
+| `pnl_source` | `closed_positions_api`, `activity_reconstruction` or `none` -- where the stored P&L numbers came from. |
+
+`data_quality` values:
+
+- **`SUFFICIENT`** / **`PARTIAL`** / **`INSUFFICIENT`** -- the closed-positions
+  request succeeded; these are the Phase 6 retrieval statuses describing how
+  complete/eligible the retrieved history was.
+- **`ACTIVITY_ONLY`** -- the request succeeded but the history was empty, and
+  the numbers present were reconstructed from `/activity` fills. Never
+  presented as authoritative closed-position accounting.
+- **`STALE`** -- the refresh failed. This is "we could not look", not "the
+  wallet has no history": the previous metrics, scores and recommendation are
+  kept exactly as they were, `hard_filter_status` becomes `STALE`, and the
+  wallet is excluded from ranking. Stale data can never produce a fresh PASS.
+
+A *successful but empty* history is **not** an error: it is reported as an
+empty/insufficient result (never `STALE`), and no ROI/win-rate/P&L is
+published from it.
+
 ## 6. Run tests
 
 ```powershell
@@ -210,22 +277,30 @@ work on this repo should follow.
 
 ## Known limitations (read before trusting the numbers)
 
-- **Wallet-discovery candidate pool is small (~20-50), not "thousands."**
-  `MAX_WALLET_CANDIDATES` is configurable, but `wallet/scanner.py` is
-  bounded by the public leaderboard (50/request) plus the seed list.
-  Nothing in this codebase claims to scan more than it actually does. This
-  is a known limitation to be addressed in a future pass, not this one.
+- **Wallet-discovery candidate pool is bounded by the page cap.**
+  `MAX_WALLET_CANDIDATES` (default 30) caps the pool per scan and
+  `wallet/scanner.py` pages the public leaderboard at
+  `LEADERBOARD_PAGE_SIZE` rows per request (hard ceiling 50) for at most
+  `MAX_LEADERBOARD_PAGES` requests (default 10) -- i.e. at most 500
+  leaderboard rows per scan even with a raised cap. Nothing in this codebase
+  claims to scan more than it actually does, and each scan's pool size is
+  printed at the end of `--scan-wallets`.
 - Frequency/rapid-trade classification needs at least
   `MIN_TRADES_FOR_FREQUENCY_CLASSIFICATION` (default 3) timestamped trades
   to produce a real classification; below that it reports `NORMAL` with
   `insufficient_data=True` rather than guessing.
-- **Wallet win-rate/ROI/drawdown/P&L show N/A** for any wallet with a
-  `data_quality` of `INSUFFICIENT_DATA` or `API_UNAVAILABLE` in
-  `data/wallets.json` (no activity retrieved, or the Polymarket API was
-  unreachable during the last `--scan-wallets`) -- this is intentional, not
-  a bug; see `CLAUDE.md`'s "Wallet analytics fix" section for the exact
-  formulas and which endpoints back each number. Re-run `--scan-wallets`
-  with working network access to populate real numbers.
+- **Wallet win-rate/ROI/drawdown/P&L show N/A** for any wallet with no
+  eligible closed positions (e.g. a `data_quality` of `INSUFFICIENT`,
+  `INSUFFICIENT_DATA` or `API_UNAVAILABLE` in `data/wallets.json`) -- this is
+  intentional, not a bug; see `CLAUDE.md`'s "Wallet analytics fix" section
+  for the exact formulas and which endpoints back each number. Re-run
+  `--scan-wallets` with working network access to populate real numbers.
+- **A `data_quality` of `STALE` means the last refresh failed** (for example
+  the closed-positions API was unreachable). The stored ROI/win-rate/P&L and
+  score are the previous successful refresh's numbers, not fresh ones, and
+  the wallet is skipped by ranking until a refresh succeeds. Check
+  `last_refresh_attempt` vs `last_successful_refresh` and
+  `data_quality_reason` in `data/wallets.json`.
 - Wallet ROI/drawdown/consistency are reconstructed from each wallet's
   *activity feed*, not a ground-truth ledger the API provides directly --
   this is the same limitation any outside observer of a wallet has.

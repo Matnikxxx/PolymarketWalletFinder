@@ -194,9 +194,12 @@
           </td>
           <td>
             {% if w.data_quality == "FULL" %}<span class="badge badge-rec" title="{{ w.data_quality_reason }}">Full</span>
+            {% elif w.data_quality == "SUFFICIENT" %}<span class="badge badge-rec" title="{{ w.data_quality_reason }}">Sufficient</span>
             {% elif w.data_quality == "ACTIVITY_ONLY" %}<span class="badge badge-blue" title="{{ w.data_quality_reason }}">Activity only</span>
             {% elif w.data_quality == "PARTIAL" %}<span class="badge badge-watch2" title="{{ w.data_quality_reason }}">Partial</span>
+            {% elif w.data_quality == "INSUFFICIENT" %}<span class="badge badge-plain" title="{{ w.data_quality_reason }}">Insufficient data</span>
             {% elif w.data_quality == "API_UNAVAILABLE" %}<span class="badge badge-reject" title="{{ w.data_quality_reason }}">API unavailable</span>
+            {% elif w.data_quality == "STALE" %}<span class="badge badge-reject" title="{{ w.data_quality_reason }}">Stale -- refresh failed</span>
             {% else %}<span class="badge badge-plain" title="{{ w.data_quality_reason }}">Insufficient data</span>{% endif %}
           </td>
           <td>{{ "Yes" if w.tracked else "No" }}</td>

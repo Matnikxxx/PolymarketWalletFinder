@@ -63,12 +63,22 @@ class Settings:
     BREAKEVEN_TOLERANCE_USDC: float = _float("BREAKEVEN_TOLERANCE_USDC", 0.01)
 
     # ---- WALLET DISCOVERY -----------------------------------------------
-    # How many candidate wallets the scanner will consider. The current
-    # scanner (wallet/scanner.py) can only source ~20 from the public
-    # leaderboard + seed list, so this is currently a soft cap on that --
-    # but pulling it into config means a future scanner that can paginate
-    # to a larger universe doesn't require touching this constant.
+    # Hard cap on the number of distinct candidate wallets a single scan
+    # will consider. The cap applies to the UNION of leaderboard-sourced
+    # candidates and the seed list (see wallet/scanner.py::scan_top_wallets).
     MAX_WALLET_CANDIDATES: int = _int("MAX_WALLET_CANDIDATES", 30)
+    # Leaderboard pagination (Phase B). The scanner walks the public
+    # leaderboard with limit/offset pages, requesting LEADERBOARD_PAGE_SIZE
+    # rows per page for at most MAX_LEADERBOARD_PAGES requests. 50 is the
+    # server-side maximum page size (Polymarket caps `limit` at 50), so any
+    # larger configured value is clamped down to 50 by the scanner.
+    # Pagination always stops early on an empty page, a short page, a
+    # repeated page, an API error, or once MAX_WALLET_CANDIDATES is filled.
+    LEADERBOARD_PAGE_SIZE: int = _int("LEADERBOARD_PAGE_SIZE", 50)
+    MAX_LEADERBOARD_PAGES: int = _int("MAX_LEADERBOARD_PAGES", 10)
+    # Hard ceiling enforced by the scanner regardless of configuration
+    # (mirrors Polymarket's documented per-request cap).
+    LEADERBOARD_MAX_PAGE_SIZE: int = 50
 
     # ---- HISTORICAL DATA COLLECTION (Phase 12 / 15) ----------------------
     # Maximum number of pages to retrieve for /activity and /closed-positions
