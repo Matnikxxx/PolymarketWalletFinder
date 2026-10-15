@@ -229,6 +229,12 @@ Every `--scan-wallets` run ends with a `SCAN DIAGNOSTICS` block reporting:
   behind each group (e.g. "Only N positions, below minimum N" -> "Only 4
   positions, below minimum 40");
 - `STALE` refreshes with their real cause (metrics kept);
+- **how far off each rejected wallet was**: the distribution of "missed by 1 /
+  2 / 3+ criteria" and an explicit "closest to passing" list of the wallets
+  that missed by a *single* criterion (these are the ones worth reviewing
+  first -- loosening nothing, just telling you where the line fell);
+- **outcome by discovery source** (leaderboard vs seed: scanned / PASS / FAIL /
+  STALE and median ROI per source);
 - the acceptance band in force (`MIN_ROI` .. `REJECT_ROI_ABOVE`, positions,
   active days, consistency, drawdown, politics) and a one-line explanation of
   how many wallets passed and why the others did not.
@@ -367,3 +373,11 @@ work on this repo should follow.
   deliberately no random rotation of leaderboard offsets: that would trade the
   best-known wallets for lower-ranked ones without any evidence they are
   better candidates.
+- **To actually widen the candidate universe**, raise `MAX_WALLET_CANDIDATES`
+  (for example 100), which now really does walk the leaderboard across
+  multiple pages at `LEADERBOARD_PAGE_SIZE` rows per page. Budget for it: each
+  scanned wallet costs up to `MAX_HISTORY_PAGES` activity pages plus up to
+  `MAX_HISTORY_PAGES` closed-position pages (both stop early on a short page),
+  so a larger pool means proportionally more API requests per scan. Watch the
+  diagnostics' "pages attempted" and the `stop reason` to see what the pool
+  size is actually buying you.

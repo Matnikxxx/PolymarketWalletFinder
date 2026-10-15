@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+import statistics
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
@@ -67,6 +68,10 @@ class CandidateRow:
     drawdown_pct: Optional[float] = None
     frequency: Optional[str] = None
     reason: str = ""
+    # Filter criteria this candidate failed (0 for PASS). INSUFFICIENT_DATA
+    # rows count their missing criteria instead, so "how far off" is honest
+    # for both outcomes.
+    failed_criteria: list = field(default_factory=list)
 
 
 @dataclass
@@ -87,6 +92,12 @@ class ScanSummary:
     # Up to _MAX_VARIANTS distinct concrete reasons per group, so a grouped
     # count can never hide which actual thresholds/values were involved.
     reason_variants: dict = field(default_factory=dict)
+    # How many criteria each FAIL wallet missed by (1 -> n, 2 -> n, ...), and
+    # the wallets that missed by exactly one -- the actionable "closest to
+    # passing" list.
+    failed_criteria_distribution: Counter = field(default_factory=Counter)
+    near_misses: list = field(default_factory=list)
+    by_source: dict = field(default_factory=dict)
     # Per-wallet causes for failed refreshes (STALE), reported separately so
     # they are not conflated with hard-filter rejections.
     stale_causes: list = field(default_factory=list)
@@ -208,6 +219,15 @@ def build_scan_summary(
 
         summary.status_counts[row.status] += 1
 
+        if result is not None:
+            if row.status == "FAIL":
+                row.failed_criteria = [
+                    reason for reason in (getattr(result, "reasons", []) or [])
+                    if not reason.startswith("Wallet meets all")
+                ]
+            elif row.status == "INSUFFICIENT_DATA":
+                row.failed_criteria = list(getattr(result, "insufficient_criteria", []) or [])
+
         if result is not None and row.status != "STALE":
             # STALE is a failed refresh, not a hard-filter rejection: its cause
             # is reported in its own section (see stale_causes) so the reason
@@ -239,6 +259,25 @@ def build_scan_summary(
             summary.frequency_counts[row.frequency] += 1
 
         summary.rows.append(row)
+
+    # --- near-miss analysis (read-only: derived from the filter's own output) ---
+    for row in summary.rows:
+        if row.status == "FAIL":
+            summary.failed_criteria_distribution[len(row.failed_criteria)] += 1
+            if len(row.failed_criteria) == 1:
+                summary.near_misses.append({"wallet": row.wallet, "reason": row.failed_criteria[0]})
+    summary.near_misses.sort(key=lambda entry: entry["wallet"])
+
+    # --- outcome split by discovery source ---------------------------------
+    for row in summary.rows:
+        bucket = summary.by_source.setdefault(
+            row.source, {"scanned": 0, "PASS": 0, "FAIL": 0, "INSUFFICIENT_DATA": 0, "STALE": 0, "rois": []}
+        )
+        bucket["scanned"] += 1
+        if row.status in bucket:
+            bucket[row.status] += 1
+        if row.roi_pct is not None:
+            bucket["rois"].append(row.roi_pct)
 
     # --- frequency penalties (mirrors wallet/ranking.py; reporting only) ---
     if settings.RAPID_TRADE_ENABLED:
@@ -341,6 +380,30 @@ def format_scan_summary(summary: ScanSummary) -> str:
         add("        changes the score/recommendation (wallet/ranking.py), and only")
         add("        PASS wallets reach the ranking step at all.")
 
+    # --- near misses -------------------------------------------------------
+    if summary.near_misses or summary.failed_criteria_distribution:
+        add("")
+        add("How far off the rejected wallets were (FAIL wallets, criteria missed):")
+        for count, n in sorted(summary.failed_criteria_distribution.items()):
+            label = "criterion" if count == 1 else "criteria"
+            add(f"  missed exactly {count} {label}: {n}")
+        if summary.near_misses:
+            add(f"  CLOSEST TO PASSING ({len(summary.near_misses)} wallet(s) one criterion away):")
+            for entry in summary.near_misses:
+                add(f"    {entry['wallet'][:12]}...: {entry['reason']}")
+
+    # --- by discovery source ----------------------------------------------
+    if summary.by_source:
+        add("")
+        add("Outcome by discovery source (where candidates came from):")
+        for source, bucket in sorted(summary.by_source.items()):
+            median_roi = f"{statistics.median(bucket['rois']):.1f}%" if bucket["rois"] else "N/A"
+            add(
+                f"  {source:<12}: {bucket['scanned']:>3} scanned, {bucket['PASS']} PASS, "
+                f"{bucket['FAIL']} FAIL, {bucket['INSUFFICIENT_DATA']} INSUFFICIENT_DATA, "
+                f"{bucket['STALE']} STALE (median ROI: {median_roi})"
+            )
+
     # --- stale refreshes ---------------------------------------------------
     if summary.stale_causes:
         add("")
@@ -375,8 +438,18 @@ def format_scan_summary(summary: ScanSummary) -> str:
             "WHY only 1 passed: the other candidates were rejected by the configured "
             "thresholds (see reason counts) -- the filter is selective by design, not broken."
         )
+        if summary.near_misses:
+            add(
+                f"  {len(summary.near_misses)} wallet(s) missed by a SINGLE criterion "
+                "(listed above) -- those are the ones worth reviewing first."
+            )
     else:
         add(f"WHY {passed} passed: the rest are below/above the configured thresholds (above).")
+        if summary.near_misses:
+            add(
+                f"  {len(summary.near_misses)} rejected wallet(s) missed by a SINGLE criterion "
+                "(listed above)."
+            )
 
     for note in summary.notes:
         add(f"NOTE: {note}")

@@ -352,3 +352,109 @@ def test_stale_wallet_records_being_seen_without_touching_its_metrics(tmp_path, 
                   "realized_pnl", "recommendation", "last_successful_refresh"):
         assert entry[field] == previous[field], field
     assert entry["discovery_source"] == "leaderboard"
+
+
+# ---------------------------------------------------------------------------
+# Near-miss analysis (Phase C "try again" pass)
+# ---------------------------------------------------------------------------
+
+def test_near_misses_lists_wallets_that_missed_by_exactly_one_criterion():
+    summary = build_scan_summary(
+        wallets=[W1, W2, W3],
+        filter_map={
+            W1: _result("FAIL", ["ROI 84.5% above reject threshold 80.0%"]),
+            W2: _result("FAIL", ["Consistency 3.0 below minimum 4.4",
+                                 "Only 8 active days, below minimum 30"]),
+            W3: _result("FAIL", ["Wallet appears resolution-only (no active exits)"]),
+        },
+    )
+
+    near = {entry["wallet"] for entry in summary.near_misses}
+    assert near == {W1, W3}                      # W2 missed by two criteria
+    assert summary.failed_criteria_distribution[1] == 2
+    assert summary.failed_criteria_distribution[2] == 1
+
+    text = format_scan_summary(summary)
+    assert "CLOSEST TO PASSING" in text
+    assert "ROI 84.5% above reject threshold 80.0%" in text
+    assert "missed exactly 1 criterion: 2" in text
+
+
+def test_failed_criteria_counts_exclude_the_informational_line():
+    summary = build_scan_summary(
+        wallets=[W1],
+        filter_map={W1: _result("FAIL", [
+            "Wallet meets all evaluable filter thresholds.",   # informational
+            "Only 8 positions, below minimum 40",
+        ])},
+    )
+
+    assert summary.rows[0].failed_criteria == ["Only 8 positions, below minimum 40"]
+    assert 1 in summary.failed_criteria_distribution
+
+
+def test_insufficient_data_rows_count_missing_criteria_instead():
+    summary = build_scan_summary(
+        wallets=[W1],
+        filter_map={W1: _result("INSUFFICIENT_DATA", ["Wallet meets all evaluable filter thresholds."],
+                                insufficient=["roi", "drawdown"])},
+    )
+
+    # INSUFFICIENT_DATA is not a FAIL: it must not appear as a near miss
+    assert not summary.near_misses
+    assert not summary.failed_criteria_distribution
+    assert summary.rows[0].failed_criteria == ["roi", "drawdown"]
+
+
+def test_outcome_is_split_by_discovery_source_with_median_roi():
+    class _Discovery:
+        pages_attempted = 1
+        pages_succeeded = 1
+        rows_returned = 30
+        rejected_addresses = 0
+        duplicates_dropped = 0
+        leaderboard_candidates = 1
+        seed_candidates = 2
+        seed_duplicates = 0
+        leaderboard_budget = 28
+        stop_reason = "short_page"
+        sources = {W1: "leaderboard", W2: "seed", W3: "seed"}
+
+    summary = build_scan_summary(
+        wallets=[W1, W2, W3],
+        discovery=_Discovery(),
+        stats_map={
+            W1: _Stats(W1, roi=24.1, positions=50, active_days=40),
+            W2: _Stats(W2, roi=84.5, positions=50, active_days=40),
+            W3: _Stats(W3, roi=90.3, positions=50, active_days=40),
+        },
+        filter_map={
+            W1: _result("FAIL", ["ROI 24.1% below minimum 25.0%"]),
+            W2: _result("PASS"),
+            W3: _result("FAIL", ["ROI 90.3% above reject threshold 80.0%"]),
+        },
+    )
+
+    assert summary.by_source["leaderboard"]["scanned"] == 1
+    assert summary.by_source["leaderboard"]["FAIL"] == 1
+    assert summary.by_source["seed"]["scanned"] == 2
+    assert summary.by_source["seed"]["PASS"] == 1
+    assert summary.by_source["seed"]["rois"] == [84.5, 90.3]
+
+    text = format_scan_summary(summary)
+    assert "Outcome by discovery source" in text
+    # a TRUE median (mean of the two middle values), not the upper-middle pick
+    assert "median ROI: 87.4%" in text
+    assert "median ROI: 24.1%" in text
+
+
+def test_headline_points_at_single_criterion_misses(tmp_path, monkeypatch, capsys):
+    wallets_file = tmp_path / "wallets.json"
+    monkeypatch.setattr(settings, "WALLETS_FILE", wallets_file)
+
+    good = FakeClient(closed_by_wallet={W1: GOOD_CLOSED}, events_by_wallet={W1: GOOD_EVENTS})
+    _scan(monkeypatch, [W1], good)
+    out = capsys.readouterr().out
+
+    # 1 PASS / 0 rejected -> no near-miss claim is fabricated
+    assert "CLOSEST TO PASSING" not in out
