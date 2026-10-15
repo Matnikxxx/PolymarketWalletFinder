@@ -55,6 +55,17 @@ class _TTLCache:
         self._store[key] = (time.time() + self.ttl, value)
 
 
+def _extract_list(data: Any) -> list[dict]:
+    """Safely extracts a list of dicts from API responses (both bare list and {"data": [...]})."""
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        items = data.get("data")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+    return []
+
+
 class PolymarketApiClient:
     """Thin, defensive wrapper around Polymarket's public HTTP APIs."""
 
@@ -166,14 +177,14 @@ class PolymarketApiClient:
         url = f"{self.data_api_base}/activity"
         params = {"user": wallet, "limit": limit, "offset": offset, "type": "TRADE"}
         data = self._get(url, params=params, use_cache=True)
-        return data if isinstance(data, list) else data.get("data", [])
+        return _extract_list(data)
 
     def get_wallet_positions(self, wallet: str) -> list[dict]:
         """Current open positions for a wallet."""
         url = f"{self.data_api_base}/positions"
         params = {"user": wallet}
         data = self._get(url, params=params, use_cache=True)
-        return data if isinstance(data, list) else data.get("data", [])
+        return _extract_list(data)
 
     def get_wallet_value(self, wallet: str) -> Optional[float]:
         """
@@ -189,10 +200,13 @@ class PolymarketApiClient:
         params = {"user": wallet}
         data = self._get(url, params=params, use_cache=True)
         if isinstance(data, list) and data:
-            try:
-                return float(data[0].get("value"))
-            except (TypeError, ValueError):
-                return None
+            item = data[0]
+            if isinstance(item, dict):
+                try:
+                    return float(item.get("value"))
+                except (TypeError, ValueError):
+                    return None
+            return None
         if isinstance(data, dict) and "value" in data:
             try:
                 return float(data["value"])
@@ -224,7 +238,7 @@ class PolymarketApiClient:
             "sortBy": sort_by, "sortDirection": sort_direction,
         }
         data = self._get(url, params=params, use_cache=True)
-        return data if isinstance(data, list) else data.get("data", [])
+        return _extract_list(data)
 
     def get_wallet_closed_positions_paginated(
         self,
@@ -295,7 +309,7 @@ class PolymarketApiClient:
             "offset": offset,
         }
         data = self._get(url, params=params, use_cache=True)
-        return data if isinstance(data, list) else data.get("data", [])
+        return _extract_list(data)
 
     def get_market(self, condition_id: Optional[str] = None, slug: Optional[str] = None) -> dict:
         """Market metadata (category, liquidity, title) by condition_id or slug."""
@@ -306,14 +320,15 @@ class PolymarketApiClient:
         if slug:
             params["slug"] = slug
         data = self._get(url, params=params, use_cache=True)
-        items = data if isinstance(data, list) else data.get("data", [])
+        items = _extract_list(data)
         return items[0] if items else {}
 
     def get_orderbook(self, token_id: str) -> dict:
         """CLOB orderbook snapshot for liquidity estimation."""
         url = f"{self.clob_api_base}/book"
         params = {"token_id": token_id}
-        return self._get(url, params=params, use_cache=True)
+        data = self._get(url, params=params, use_cache=True)
+        return data if isinstance(data, dict) else {}
 
     # ------------------------------------------------------------------
     # NOTE: Intentionally no order-placement / signing methods exist here.

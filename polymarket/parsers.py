@@ -57,6 +57,8 @@ def normalize_activity_event(raw: dict) -> dict:
     callers that only want trades must filter on `activity_type == "TRADE"`
     (see polymarket.wallet_activity.fetch_wallet_events, which does this).
     """
+    if not isinstance(raw, dict):
+        raw = {}
     activity_type = (raw.get("type") or "TRADE").upper()
 
     side = (raw.get("side") or "").upper()
@@ -88,6 +90,8 @@ def normalize_activity_event(raw: dict) -> dict:
 
 
 def normalize_position(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
     return {
         "condition_id": raw.get("conditionId") or raw.get("condition_id"),
         "token_id": raw.get("asset") or raw.get("tokenId") or raw.get("token_id"),
@@ -102,6 +106,8 @@ def normalize_position(raw: dict) -> dict:
 
 
 def normalize_market(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
     category = (raw.get("category") or raw.get("category_slug") or "").strip()
     if not category:
         # fallback heuristic only used when the API genuinely has no category field
@@ -127,6 +133,8 @@ def normalize_market(raw: dict) -> dict:
 
 
 def normalize_leaderboard_entry(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
     return {
         "wallet": (raw.get("proxyWallet") or raw.get("wallet") or raw.get("user") or "").lower(),
         "pnl": _to_float(raw.get("pnl") or raw.get("profit")),
@@ -146,6 +154,8 @@ def normalize_closed_position(raw: dict) -> dict:
     `realized_pnl` here is Polymarket's own authoritative figure -- NOT
     reconstructed from raw fills.
     """
+    if not isinstance(raw, dict):
+        raw = {}
     avg_price = _to_float(raw.get("avgPrice"))
     total_bought = _to_float(raw.get("totalBought"))
     return {
