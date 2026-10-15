@@ -191,13 +191,54 @@ Phase 7 frequency analysis (`analytics/frequency_models.py`, `analytics/frequenc
 - Every address is validated against `^0x[a-fA-F0-9]{40}$` and normalized to
   lowercase. Rows that fail validation are skipped individually (and counted)
   -- one malformed row never aborts a scan.
-- Candidates are de-duplicated globally across pages and against the seed
-  list, leaderboard ordering is preserved, and valid seeds are appended
+- Candidate addresses are de-duplicated globally across pages and against the
+  seed list, leaderboard ordering is preserved, and valid seeds are appended
   afterwards. The overall `MAX_WALLET_CANDIDATES` cap covers the union.
-- A healthy leaderboard therefore fills the pool on its own by default; seeds
-  matter when the leaderboard is short/unavailable or when the cap is raised.
-  Seed wallets that were already stored in `data/wallets.json` are never lost
+- **Seed capacity is reserved.** The leaderboard is PnL-ordered, so its top
+  rows change slowly; if it were allowed to consume the whole candidate budget,
+  every scan would rediscover an almost identical pool and the seed list would
+  never be scanned at all (exactly what happened before this was fixed). When
+  the cap can hold the whole seed list plus at least one leaderboard wallet,
+  the leaderboard walk is bounded by `MAX_WALLET_CANDIDATES - seeds` and the
+  seeds fill the rest. If the cap is smaller than the seed list, the
+  leaderboard takes the whole cap and seeds get no slots.
+- Offsets advance by the rows the leaderboard actually returned, and each
+  request is capped by the remaining budget, so pages never overlap, skip, or
+  ask for more rows than needed.
+- Repeated candidates are often legitimate: if the same wallets really are the
+  top PnL traders this month, the same wallets come back. `--scan-wallets` now
+  records `first_seen_at`, `last_seen_at`, `times_seen` and `discovery_source`
+  per wallet so repeats are measurable, and prints a diagnostics block that
+  lists pages attempted, rows returned, invalid/duplicate addresses, seeds
+  added, known-vs-new candidates, and why each candidate passed or failed.
+- Seed wallets that were already stored in `data/wallets.json` are never lost
   either way -- see below.
+
+### Scan diagnostics
+
+Every `--scan-wallets` run ends with a `SCAN DIAGNOSTICS` block reporting:
+
+- leaderboard pages attempted/succeeded and why pagination stopped;
+- rows returned, addresses rejected as invalid, duplicate addresses dropped;
+- candidates from the leaderboard vs seeds (and seeds already on the board);
+- candidates this scan, previously known, new, and previously stored wallets
+  that were not rediscovered;
+- counts of `PASS` / `FAIL` / `INSUFFICIENT_DATA` / `STALE` plus the resulting
+  recommendations;
+- hard-filter rejection reasons grouped by cause, with the concrete values
+  behind each group (e.g. "Only N positions, below minimum N" -> "Only 4
+  positions, below minimum 40");
+- `STALE` refreshes with their real cause (metrics kept);
+- the acceptance band in force (`MIN_ROI` .. `REJECT_ROI_ABOVE`, positions,
+  active days, consistency, drawdown, politics) and a one-line explanation of
+  how many wallets passed and why the others did not.
+
+Diagnostics are read-only aggregation of results the pipeline already
+computed: they never recompute a metric, re-run a filter, re-rank, or change a
+threshold. Frequency classification is reported as a **score penalty**, not an
+exclusion -- `wallet/ranking.py` never removes a wallet from ranking because of
+its cadence; a `BOT_LIKE` wallet simply cannot be `RECOMMENDED` (and only
+`PASS` wallets reach ranking at all).
 
 `--scan-wallets` **merges** into `data/wallets.json`, it never rebuilds it:
 
@@ -222,6 +263,9 @@ Each scanned record carries:
 | `data_quality` | `SUFFICIENT`, `PARTIAL`, `INSUFFICIENT`, `ACTIVITY_ONLY` or `STALE` -- see below. |
 | `data_quality_reason` | Human-readable explanation of the value above. |
 | `pnl_source` | `closed_positions_api`, `activity_reconstruction` or `none` -- where the stored P&L numbers came from. |
+| `first_seen_at` / `last_seen_at` | When this wallet was first discovered, and when a scan last rediscovered it. |
+| `times_seen` | How many scans have rediscovered it (a scan that fails to refresh it still counts -- it was seen). |
+| `discovery_source` | `leaderboard` or `seed` -- which input produced it. Kept from the last known source if unknown. |
 
 `data_quality` values:
 
@@ -306,3 +350,20 @@ work on this repo should follow.
   this is the same limitation any outside observer of a wallet has.
 - Small sample sizes produce noisy stats by design -- the tools
   deliberately surface a warning rather than hide it.
+- **A low PASS rate is expected with the default thresholds.** The accepted
+  ROI band is `[MIN_ROI, REJECT_ROI_ABOVE]` = `[15%, 80%]` -- a *higher* ROI
+  above the cap is a rejection reason, not a better candidate -- combined with
+  `MIN_POSITIONS=40`, `MIN_ACTIVE_DAYS=30`, `MIN_CONSISTENCY=4.4`,
+  `MAX_DRAWDOWN=20%`, the resolution-only exclusion and the politics share
+  rule. On a 30-wallet pool it is normal for only one or two wallets to clear
+  every threshold. If you want more candidates, widen the market universe
+  before loosening the thresholds -- and note that loosening them changes what
+  "qualified" means. Check the `SCAN DIAGNOSTICS` rejection-reason counts
+  before assuming the filter is broken.
+- **Repeated candidates across scans are normal** when the top PnL traders on
+  the leaderboard genuinely do not change. Use `times_seen` /
+  `first_seen_at` in `data/wallets.json` and the "new this scan" line in the
+  diagnostics block to tell repetition from a discovery problem. There is
+  deliberately no random rotation of leaderboard offsets: that would trade the
+  best-known wallets for lower-ranked ones without any evidence they are
+  better candidates.

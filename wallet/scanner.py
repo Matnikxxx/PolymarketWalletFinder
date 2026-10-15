@@ -90,10 +90,49 @@ class DiscoveryResult:
     pages_attempted: int = 0
     pages_succeeded: int = 0
     stop_reason: str = "not_started"
+    # --- Phase C diagnostics -------------------------------------------
+    # Rows the leaderboard actually returned (before validation), duplicate
+    # leaderboard addresses dropped, seeds that were already discovered from
+    # the leaderboard, and the leaderboard slice of the candidate budget.
+    rows_returned: int = 0
+    duplicates_dropped: int = 0
+    seed_duplicates: int = 0
+    leaderboard_budget: int = 0
+    # address -> "leaderboard" | "seed" (which source produced it)
+    sources: dict[str, str] = field(default_factory=dict)
 
     @property
     def total_candidates(self) -> int:
         return len(self.candidates)
+
+
+class CandidateList(list):
+    """
+    The candidate address list returned by scan_top_wallets().
+
+    It IS a plain ``list[str]`` (every existing caller keeps working), with one
+    extra attribute: ``.discovery``, the DiscoveryResult that produced it, so
+    callers such as main.py can report accurate discovery counters without a
+    second API walk. Code that mocks scan_top_wallets() with a plain list
+    simply finds no ``.discovery`` and degrades gracefully.
+    """
+
+    def __init__(self, candidates, discovery: DiscoveryResult):
+        super().__init__(candidates)
+        self.discovery = discovery
+
+
+def _valid_seed_candidates() -> list[str]:
+    """Valid, lowercase, de-duplicated seed addresses in their declared order."""
+    seeds: list[str] = []
+    for raw_seed in SEED_CANDIDATE_WALLETS:
+        seed = normalize_wallet_address(raw_seed)
+        if seed is None:
+            logger.warning("WALLET_DISCOVERY_INVALID_SEED value=%r", raw_seed)
+            continue
+        if seed not in seeds:
+            seeds.append(seed)
+    return seeds
 
 
 def discover_candidates(
@@ -111,6 +150,21 @@ def discover_candidates(
     (clamped to 50) and `max_pages` to ``settings.MAX_LEADERBOARD_PAGES``.
     Never raises: an API failure simply ends leaderboard discovery and the
     valid seeds are used instead.
+
+    Seed capacity (Phase C fix)
+    ---------------------------
+    The leaderboard is ordered by PnL and its top rows barely change between
+    scans, so letting it consume the WHOLE candidate budget made every scan
+    rediscover essentially the same wallets and silently dropped the seed list
+    entirely (the seed loop had no room left). When the configured cap can hold
+    the whole seed list plus at least one leaderboard wallet, the seeds'
+    capacity is therefore reserved up front: the leaderboard walk is bounded by
+    ``limit - len(valid_seeds)`` and the seeds are appended afterwards, exactly
+    as ``scan_top_wallets`` documents. If the cap is smaller than the seed list
+    itself, the old behaviour is kept (leaderboard first, no seed room).
+
+    Offsets advance by the number of rows the leaderboard actually returned, so
+    pages can never overlap even when a page is shorter than requested.
     """
     limit = settings.MAX_WALLET_CANDIDATES if limit is None else int(limit)
     configured_page_size = settings.LEADERBOARD_PAGE_SIZE if page_size is None else page_size
@@ -122,14 +176,23 @@ def discover_candidates(
         logger.info("WALLET_DISCOVERED total_candidates=0 stop_reason=%s", result.stop_reason)
         return result
 
-    # Page stride is fixed for the whole walk so offsets stay aligned:
-    # never ask for more rows than the remaining candidate budget, never
-    # more than the API's 50-row ceiling, and never fewer than 1 row.
+    valid_seeds = _valid_seed_candidates()
+    # Reserve room for the seeds when the cap can hold all of them plus at
+    # least one leaderboard wallet; otherwise the leaderboard gets the lot.
+    if limit > len(valid_seeds):
+        result.leaderboard_budget = limit - len(valid_seeds)
+    else:
+        result.leaderboard_budget = limit
+
+    # Page stride honours the configured page size (never above the API's
+    # 50-row ceiling and never above the leaderboard budget). It is NOT clamped
+    # to the candidate cap any more: doing that made LEADERBOARD_PAGE_SIZE
+    # silently ineffective at default settings.
     try:
         requested_page_size = int(configured_page_size)
     except (TypeError, ValueError):
         requested_page_size = LEADERBOARD_MAX_PAGE_SIZE
-    page_stride = max(1, min(requested_page_size, LEADERBOARD_MAX_PAGE_SIZE, limit))
+    page_stride = max(1, min(requested_page_size, LEADERBOARD_MAX_PAGE_SIZE, result.leaderboard_budget))
 
     try:
         page_cap = max(0, int(configured_max_pages))
@@ -138,20 +201,22 @@ def discover_candidates(
 
     seen: set[str] = set()
     page_signatures: set[tuple[str, ...]] = set()
+    offset = 0
 
     for page_index in range(page_cap):
-        if len(result.candidates) >= limit:
-            result.stop_reason = "candidate_limit"
+        if len(result.candidates) >= result.leaderboard_budget:
+            result.stop_reason = "leaderboard_budget"
             break
 
-        offset = page_index * page_stride
+        # Never request more rows than the remaining leaderboard budget.
+        request_limit = min(page_stride, result.leaderboard_budget - len(result.candidates))
         result.pages_attempted += 1
         try:
             raw_board = client.get_leaderboard(
                 category="OVERALL",
                 time_period="MONTH",
                 order_by="PNL",
-                limit=page_stride,
+                limit=request_limit,
                 offset=offset,
             )
         except ApiError as exc:
@@ -183,6 +248,8 @@ def discover_candidates(
             result.stop_reason = "empty_page"
             break
 
+        result.rows_returned += len(raw_board)
+
         page_addresses: list[str] = []
         for raw in raw_board:
             entry = normalize_leaderboard_entry(raw) if isinstance(raw, dict) else {}
@@ -206,17 +273,23 @@ def discover_candidates(
 
         for address in page_addresses:
             if address in seen:
+                result.duplicates_dropped += 1
                 continue
-            if len(result.candidates) >= limit:
+            if len(result.candidates) >= result.leaderboard_budget:
                 break
             seen.add(address)
             result.candidates.append(address)
+            result.sources[address] = "leaderboard"
 
-        if len(result.candidates) >= limit:
-            result.stop_reason = "candidate_limit"
+        # Advance by the rows actually consumed, so a short page can never
+        # make the next page overlap the previous one.
+        offset += len(raw_board)
+
+        if len(result.candidates) >= result.leaderboard_budget:
+            result.stop_reason = "leaderboard_budget"
             break
 
-        if len(raw_board) < page_stride:
+        if len(raw_board) < request_limit:
             # Fewer rows than requested -> the leaderboard is exhausted.
             result.stop_reason = "short_page"
             break
@@ -228,28 +301,27 @@ def discover_candidates(
 
     result.leaderboard_candidates = len(result.candidates)
 
-    for raw_seed in SEED_CANDIDATE_WALLETS:
+    for seed in valid_seeds:
         if len(result.candidates) >= limit:
             break
-        seed = normalize_wallet_address(raw_seed)
-        if seed is None:
-            result.rejected_addresses += 1
-            logger.warning("WALLET_DISCOVERY_INVALID_SEED value=%r", raw_seed)
-            continue
         if seed in seen:
+            result.seed_duplicates += 1
             continue
         seen.add(seed)
         result.candidates.append(seed)
+        result.sources[seed] = "seed"
         result.seed_candidates += 1
 
     logger.info(
-        "WALLET_DISCOVERED source=leaderboard pages_attempted=%d pages_succeeded=%d "
-        "rejected_addresses=%d stop_reason=%s count=%d",
-        result.pages_attempted, result.pages_succeeded, result.rejected_addresses,
+        "WALLET_DISCOVERED source=leaderboard pages_attempted=%d pages_succeeded=%d rows_returned=%d "
+        "duplicates_dropped=%d rejected_addresses=%d budget=%d stop_reason=%s count=%d",
+        result.pages_attempted, result.pages_succeeded, result.rows_returned,
+        result.duplicates_dropped, result.rejected_addresses, result.leaderboard_budget,
         result.stop_reason, result.leaderboard_candidates,
     )
     logger.info(
-        "WALLET_DISCOVERED source=seed count=%d", result.seed_candidates
+        "WALLET_DISCOVERED source=seed count=%d already_discovered=%d",
+        result.seed_candidates, result.seed_duplicates,
     )
     logger.info("WALLET_DISCOVERED total_candidates=%d", result.total_candidates)
     return result
@@ -270,7 +342,17 @@ def scan_top_wallets(
     `max_pages` default to settings.LEADERBOARD_PAGE_SIZE (max 50) and
     settings.MAX_LEADERBOARD_PAGES. Discovery is best-effort: it degrades to
     the seed list rather than raising when the leaderboard is unavailable.
+
+    When the cap can hold the whole seed list plus at least one leaderboard
+    wallet, that capacity is reserved for the seeds up front (see
+    discover_candidates), so a scan always includes the curated seed
+    candidates and no longer rediscovers an identical leaderboard-only pool
+    every time.
+
+    Returns a CandidateList: a plain ``list[str]`` that additionally carries
+    ``.discovery`` (the DiscoveryResult) for accurate scan diagnostics.
     """
-    return discover_candidates(
+    discovery = discover_candidates(
         client, limit=limit, page_size=page_size, max_pages=max_pages
-    ).candidates
+    )
+    return CandidateList(discovery.candidates, discovery)

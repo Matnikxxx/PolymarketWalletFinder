@@ -41,6 +41,17 @@ wallets the user explicitly chooses to track.
   scores. It sets `data_quality="STALE"`, `hard_filter_status="STALE"`, updates
   `last_refresh_attempt`, leaves `last_successful_refresh` untouched, and bars
   the wallet from ranking. A *successful empty* response is not stale.
+- Discovery must keep the seed list reachable: the leaderboard walk is bounded
+  by `MAX_WALLET_CANDIDATES - len(seeds)` whenever the cap can hold the whole
+  seed list, so a scan never rediscovers a leaderboard-only pool.
+- Every scanned candidate records `first_seen_at`/`last_seen_at`/`times_seen`/
+  `discovery_source`; a wallet that is only rediscovered keeps its metrics.
+- `monitor/scan_report.py` aggregates diagnostics read-only: it must never
+  recompute metrics, re-run filters, re-rank, or alter thresholds, and it must
+  state that frequency penalties affect the score, not ranking eligibility.
+- Do not lower hard-filter thresholds or add leaderboard rotation to raise the
+  PASS count. Report the rejection-reason counts and leave the decision to the
+  user.
 - Do not commit `.env`, credentials, local logs, or user data.
 
 ## Change workflow

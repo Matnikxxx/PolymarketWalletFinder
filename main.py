@@ -42,6 +42,7 @@ from wallet.monitor import (
     wallet_address_key,
 )
 from monitor.status import print_wallet_ranking, print_verification, print_dashboard, print_wallet_report
+from monitor.scan_report import build_scan_summary, print_scan_summary
 from analytics.dashboard import build_dashboard_data
 
 logger = logging.getLogger("main")
@@ -107,8 +108,34 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _candidate_history_fields(previous: dict, seen_at: str, source: str | None) -> dict:
+    """
+    Candidate-identity history for one rediscovered wallet (Phase C).
+
+    `first_seen_at` is only ever set once, `last_seen_at`/`times_seen` advance
+    on every scan that actually rediscovered the wallet, and `discovery_source`
+    records whether this scan found it on the leaderboard or in the seed list
+    (an existing value is kept when the current source is unknown). Nothing
+    here is a performance metric -- a wallet that is merely *rediscovered* is
+    still recorded, which is how repeated candidates become measurable instead
+    of anecdotal.
+    """
+    previous = previous if isinstance(previous, dict) else {}
+    try:
+        times_seen = int(previous.get("times_seen") or 0) + 1
+    except (TypeError, ValueError):
+        times_seen = 1
+    return {
+        "first_seen_at": previous.get("first_seen_at") or seen_at,
+        "last_seen_at": seen_at,
+        "times_seen": times_seen,
+        "discovery_source": source or previous.get("discovery_source") or "unknown",
+    }
+
+
 def _stale_wallet_update(
-    wallet: str, previous: dict, attempted_at: str, reason: str
+    wallet: str, previous: dict, attempted_at: str, reason: str,
+    discovery_source: str | None = None,
 ) -> dict:
     """
     Build the wallets.json update for a wallet whose refresh failed (Phase B,
@@ -130,6 +157,7 @@ def _stale_wallet_update(
     update["hard_filter_insufficient_criteria"] = list(
         previous.get("hard_filter_insufficient_criteria") or []
     )
+    update.update(_candidate_history_fields(previous, attempted_at, discovery_source))
     update["last_refresh_attempt"] = attempted_at
     update["last_successful_refresh"] = previous.get("last_successful_refresh")
     # `pnl_source` describes where the RETAINED numbers came from; when there
@@ -182,6 +210,11 @@ def _fresh_data_quality(stats, closed_rows_returned: bool) -> tuple[str, str, st
 def cmd_scan_wallets(args) -> None:
     client = PolymarketApiClient()
     wallets = scan_top_wallets(client, limit=settings.MAX_WALLET_CANDIDATES)
+    # Discovery counters (pages attempted/succeeded, rows, validation and
+    # de-duplication counts, per-wallet source). None when scan_top_wallets is
+    # mocked/wrapped by a caller that returns a plain list.
+    discovery = getattr(wallets, "discovery", None)
+    discovery_sources = dict(getattr(discovery, "sources", {}) or {})
     refresh_attempt_at = _utc_now_iso()
 
     # Existing records are loaded BEFORE anything is written, so a scan can
@@ -204,6 +237,7 @@ def cmd_scan_wallets(args) -> None:
     closed_rows_returned_map: dict[str, bool] = {}
     stale_updates: dict[str, dict] = {}
     stale_wallets: list[str] = []
+    stale_causes_map: dict[str, list[str]] = {}
 
     for w in wallets:
         short = w[:10] + "..."
@@ -324,9 +358,11 @@ def cmd_scan_wallets(args) -> None:
                 "retained unchanged; this scan's data is STALE and cannot qualify as a fresh PASS."
             )
             stale_updates[w] = _stale_wallet_update(
-                w, existing_by_key.get(w, {}), refresh_attempt_at, reason
+                w, existing_by_key.get(w, {}), refresh_attempt_at, reason,
+                discovery_sources.get(w),
             )
             stale_wallets.append(w)
+            stale_causes_map[w] = list(stale_reasons)
             filter_map[w] = WalletFilterResult(
                 passed=False,
                 reasons=[reason],
@@ -402,6 +438,10 @@ def cmd_scan_wallets(args) -> None:
             "last_refresh_attempt": refresh_attempt_at,
             "last_successful_refresh": refresh_attempt_at,
         }
+        cfg.update(_candidate_history_fields(
+            existing_by_key.get(card.wallet, {}), refresh_attempt_at,
+            discovery_sources.get(card.wallet),
+        ))
         cfg["last_score"] = card.final_score
         cfg["recommendation"] = card.recommendation
         cfg["frequency_classification"] = card.frequency_classification
@@ -458,6 +498,9 @@ def cmd_scan_wallets(args) -> None:
             "last_refresh_attempt": refresh_attempt_at,
             "last_successful_refresh": refresh_attempt_at,
         }
+        cfg.update(_candidate_history_fields(
+            existing_by_key.get(w, {}), refresh_attempt_at, discovery_sources.get(w)
+        ))
         cfg["last_score"] = None
         cfg["recommendation"] = "HARD_FILTER_REJECT" if fres.status == "FAIL" else "HARD_FILTER_INSUFFICIENT_DATA"
         cfg["hard_filter_status"] = fres.status
@@ -487,14 +530,24 @@ def cmd_scan_wallets(args) -> None:
     merged_records = merge_wallet_records(existing_records, updates)
     save_wallet_config(merged_records)
     retained = max(0, len(merged_records) - len(updates))
-    print(f"\nSaved {len(merged_records)} wallet records to {settings.WALLETS_FILE}")
-    print(
-        f"  {len(cards)} passed hard filter and were ranked."
+
+    # Phase C: print an honest, read-only explanation of what this scan found
+    # and why each candidate was classified the way it was.
+    summary = build_scan_summary(
+        wallets=wallets,
+        discovery=discovery,
+        existing_records=existing_records,
+        stats_map=stats_map,
+        filter_map=filter_map,
+        freq_map=freq_map,
+        stale_wallets=stale_wallets,
+        stale_causes=stale_causes_map,
+        updates=updates,
+        cards=cards,
     )
-    if fail_wallets:
-        print(f"  {len(fail_wallets)} rejected by hard filter (see hard_filter_status=FAIL).")
-    if insufficient_wallets:
-        print(f"  {len(insufficient_wallets)} have insufficient data for full filtering.")
+    print_scan_summary(summary)
+
+    print(f"\nSaved {len(merged_records)} wallet records to {settings.WALLETS_FILE}")
     if stale_wallets:
         print(
             f"  {len(stale_wallets)} could not be refreshed (hard_filter_status=STALE); "

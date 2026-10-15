@@ -20,6 +20,7 @@ from config.settings import settings
 from polymarket.api_client import PolymarketApiClient, ApiError
 from wallet.scanner import (
     SEED_CANDIDATE_WALLETS,
+    CandidateList,
     discover_candidates,
     is_valid_wallet_address,
     normalize_wallet_address,
@@ -134,7 +135,13 @@ def test_malformed_rows_do_not_crash_discovery():
 # ---------------------------------------------------------------------------
 
 def test_pagination_offset_progression_and_overall_limit():
-    """limit=120 walks offsets 0/50/100 with a 50-row page size, then stops."""
+    """
+    limit=120 walks offsets 0/50/100 with a 50-row page size, then stops.
+
+    The leaderboard budget is 110 (120 minus the 10 reserved seed slots), so the
+    last page only asks for the 10 rows it still needs -- offsets stay aligned
+    with the 50-row stride because offset advances by rows returned.
+    """
     client = _client_returning({
         0: _page(1, 50),
         50: _page(51, 50),
@@ -146,9 +153,11 @@ def test_pagination_offset_progression_and_overall_limit():
     offsets = [call.kwargs["offset"] for call in client.get_leaderboard.call_args_list]
     limits = [call.kwargs["limit"] for call in client.get_leaderboard.call_args_list]
     assert offsets == [0, 50, 100]
-    assert limits == [50, 50, 50]
+    assert limits == [50, 50, 10]
     assert len(result.candidates) == 120
-    assert result.stop_reason == "candidate_limit"
+    assert result.leaderboard_candidates == 110
+    assert result.seed_candidates == 10
+    assert result.stop_reason == "leaderboard_budget"
     assert result.pages_attempted == 3
     assert result.pages_succeeded == 3
 
@@ -307,3 +316,116 @@ def test_scan_top_wallets_returns_a_plain_address_list():
     assert isinstance(candidates, list)
     assert all(isinstance(c, str) for c in candidates)
     assert all(c == c.lower() for c in candidates)
+
+
+# ---------------------------------------------------------------------------
+# Seed capacity reservation (Phase C defect fix)
+# ---------------------------------------------------------------------------
+
+def test_default_settings_do_not_starve_the_seed_list():
+    """
+    Regression: with default settings the leaderboard used to consume the whole
+    candidate budget, so seed wallets were NEVER scanned -- every scan then
+    rediscovered an identical leaderboard-only pool.
+    """
+    client = _always_full_client()
+
+    result = discover_candidates(client, limit=30, page_size=50, max_pages=10)
+
+    assert result.leaderboard_budget == 20          # 30 - 10 reserved seed slots
+    assert result.leaderboard_candidates == 20
+    assert result.seed_candidates == 10
+    assert result.total_candidates == 30
+    assert set(SEEDS).issubset(set(result.candidates))
+    assert result.stop_reason == "leaderboard_budget"
+    assert client.get_leaderboard.call_args_list[0].kwargs["limit"] == 20
+
+
+def test_configured_page_size_is_honoured_without_being_clamped_to_the_cap():
+    """The page request honours LEADERBOARD_PAGE_SIZE (<=50), not the cap."""
+    client = _always_full_client()
+
+    client.get_leaderboard.side_effect = None
+    client.get_leaderboard.return_value = _page(1, 50)
+    discover_candidates(client, limit=30, page_size=50, max_pages=10)
+
+    # budget 20 <= page size 50, so one 20-row request
+    assert client.get_leaderboard.call_args_list[0].kwargs["limit"] == 20
+
+
+def test_offsets_advance_by_rows_returned_so_pages_cannot_overlap():
+    """
+    offset advances by the rows the leaderboard actually returned, and each
+    request shrinks to the remaining leaderboard budget (never a gap, never an
+    overlap, never more rows than still needed).
+    """
+    client = _client_returning({
+        0: _page(1, 30),
+        30: _page(31, 20),
+    })
+
+    result = discover_candidates(client, limit=60, page_size=30, max_pages=5)
+
+    calls = client.get_leaderboard.call_args_list
+    assert [c.kwargs["offset"] for c in calls] == [0, 30]
+    assert [c.kwargs["limit"] for c in calls] == [30, 20]
+    assert result.leaderboard_candidates == 50
+    assert result.seed_candidates == 10
+    assert len(result.candidates) == len(set(result.candidates))
+    assert result.stop_reason == "leaderboard_budget"
+
+
+def test_short_page_after_a_full_page_still_stops_the_walk():
+    client = _client_returning({0: _page(1, 30), 30: _page(31, 5)})
+
+    result = discover_candidates(client, limit=200, page_size=30, max_pages=5)
+
+    assert client.get_leaderboard.call_count == 2      # no third request
+    assert result.stop_reason == "short_page"
+    assert result.leaderboard_candidates == 35
+
+
+def test_seed_reservation_is_skipped_when_cap_is_smaller_than_the_seed_list():
+    """limit < seed count keeps leaderboard-first behaviour (no seed slots)."""
+    client = _always_full_client()
+
+    result = discover_candidates(client, limit=5, page_size=50, max_pages=5)
+
+    assert result.leaderboard_budget == 5
+    assert result.seed_candidates == 0
+    assert not any(c in SEEDS for c in result.candidates)
+
+
+def test_seed_already_on_the_leaderboard_is_counted_not_duplicated():
+    client = _client_returning({0: [_entry(SEEDS[0])] + _page(1, 30)})
+
+    result = discover_candidates(client, limit=30, page_size=50, max_pages=5)
+
+    assert result.seed_duplicates == 1
+    assert result.candidates.count(SEEDS[0]) == 1
+    assert result.sources[SEEDS[0]] == "leaderboard"    # first source wins
+
+
+def test_discovery_reports_rows_validation_and_duplicate_counters():
+    client = _client_returning({
+        0: [_entry(_addr(1)), _entry("nope"), _entry(_addr(1)), _entry(_addr(3))],
+    })
+
+    result = discover_candidates(client, limit=30, page_size=10, max_pages=5)
+
+    assert result.rows_returned == 4
+    assert result.rejected_addresses == 1      # "nope"
+    assert result.duplicates_dropped == 1      # second _addr(1)
+    assert result.leaderboard_candidates == 2
+    assert result.sources[_addr(1)] == "leaderboard"
+
+
+def test_scan_top_wallets_still_returns_a_plain_list_carrying_counters():
+    client = _always_full_client()
+
+    candidates = scan_top_wallets(client, limit=30, page_size=50, max_pages=5)
+
+    assert isinstance(candidates, list)
+    assert isinstance(candidates, CandidateList)     # carries .discovery
+    assert candidates.discovery.seed_candidates == 10
+    assert list(candidates) == candidates.discovery.candidates

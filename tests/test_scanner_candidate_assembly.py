@@ -40,7 +40,13 @@ def _mock_leaderboard_entry(wallet: str, rank: int = 1, pnl: float = 1000.0) -> 
 
 
 def test_leaderboard_requested_with_configured_page_size(monkeypatch):
-    """The first page is requested at offset 0 with the configured page size."""
+    """
+    The first page is requested at offset 0, sized by the leaderboard budget.
+
+    With MAX_WALLET_CANDIDATES=30 the 10-strong seed list has its capacity
+    reserved (Phase C), so the leaderboard slice is 20 -- a request for 20 rows
+    at offset 0, never above the configured 50-row page size nor the API cap.
+    """
     monkeypatch.setattr(settings, "LEADERBOARD_PAGE_SIZE", 50)
     client = MagicMock(spec=PolymarketApiClient)
     client.get_leaderboard.return_value = []
@@ -49,9 +55,7 @@ def test_leaderboard_requested_with_configured_page_size(monkeypatch):
 
     assert client.get_leaderboard.called
     call_kwargs = client.get_leaderboard.call_args[1]
-    # Page size never exceeds the remaining candidate budget (30) or the
-    # API's 50-row ceiling.
-    assert call_kwargs.get("limit") == 30
+    assert call_kwargs.get("limit") == 20
     assert call_kwargs.get("offset") == 0
     assert call_kwargs.get("category") == "OVERALL"
     assert call_kwargs.get("time_period") == "MONTH"
@@ -113,9 +117,10 @@ def test_candidate_count_strictly_capped_at_limit():
 
     candidates = scan_top_wallets(client, limit=25)
 
+    # 25 - 10 seeds = 15 leaderboard slots reserved for the seeds (Phase C).
     assert len(candidates) == 25
-    assert candidates[:20] == lb_wallets
-    assert candidates[20:] == [s.lower() for s in SEED_CANDIDATE_WALLETS[:5]]
+    assert candidates[:15] == lb_wallets[:15]
+    assert candidates[15:] == [s.lower() for s in SEED_CANDIDATE_WALLETS]
 
 
 def test_fewer_candidates_and_api_error_fallback():
