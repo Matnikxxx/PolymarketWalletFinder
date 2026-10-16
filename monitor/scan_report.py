@@ -27,8 +27,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
-from config.settings import settings
+from config.settings import CONFIG_ISSUES, settings, setting_source
 from tabulate import tabulate
+from wallet.scanner import SEED_CANDIDATE_WALLETS
 
 logger = logging.getLogger("monitor.scan_report")
 
@@ -162,6 +163,9 @@ def build_scan_summary(
             "seed_duplicates": getattr(discovery, "seed_duplicates", None),
             "leaderboard_budget": getattr(discovery, "leaderboard_budget", None),
             "stop_reason": getattr(discovery, "stop_reason", None),
+            "page_row_counts": list(getattr(discovery, "page_row_counts", []) or []),
+            "short_pages": getattr(discovery, "short_pages", 0),
+            "notes": list(getattr(discovery, "notes", []) or []),
         }
         summary.discovery["sources"] = dict(getattr(discovery, "sources", {}) or {})
     else:
@@ -319,6 +323,10 @@ def format_scan_summary(summary: ScanSummary) -> str:
             f"{d['invalid_addresses']} rejected (bad address), "
             f"{d['duplicates_dropped']} duplicate(s) dropped"
         )
+        if d.get("page_row_counts"):
+            short = d.get("short_pages", 0)
+            note = " (server-clipped pages are walked through, not treated as the end)" if short else ""
+            add(f"  rows per page          : {d['page_row_counts']}  short pages: {short}{note}")
         add(
             f"  candidates from board  : {d['leaderboard_candidates']} "
             f"(leaderboard budget: {d['leaderboard_budget']})"
@@ -338,6 +346,38 @@ def format_scan_summary(summary: ScanSummary) -> str:
             f"  not rediscovered       : {summary.retained_not_rediscovered} "
             "(kept unchanged in data/wallets.json)"
         )
+
+    # --- effective configuration -------------------------------------------
+    add("")
+    add("Configuration in force (effective value, source):")
+    add(
+        f"  MAX_WALLET_CANDIDATES : {settings.MAX_WALLET_CANDIDATES} "
+        f"(from {setting_source('MAX_WALLET_CANDIDATES')})"
+    )
+    add(
+        f"  LEADERBOARD_PAGE_SIZE : {settings.LEADERBOARD_PAGE_SIZE} "
+        f"(effective max {settings.LEADERBOARD_MAX_PAGE_SIZE}, "
+        f"from {setting_source('LEADERBOARD_PAGE_SIZE')})"
+    )
+    add(
+        f"  MAX_LEADERBOARD_PAGES : {settings.MAX_LEADERBOARD_PAGES} "
+        f"(from {setting_source('MAX_LEADERBOARD_PAGES')})"
+    )
+    if summary.discovery and summary.discovery.get("leaderboard_budget") is not None:
+        add(
+            f"  this scan's budget    : {summary.discovery['leaderboard_budget']} leaderboard row(s) "
+            f"+ {summary.discovery.get('seed_candidates', 0)} of {len(SEED_CANDIDATE_WALLETS)} seed(s) used"
+        )
+    if setting_source("MAX_WALLET_CANDIDATES") == "process environment":
+        add(
+            "  NOTE: the process environment -- not .env -- supplied MAX_WALLET_CANDIDATES. "
+            "An exported/IDE variable wins over .env; unset it to use .env."
+        )
+    for issue in CONFIG_ISSUES:
+        add(f"  CONFIG ISSUE: {issue}")
+    if summary.discovery and summary.discovery.get("notes"):
+        for note in summary.discovery["notes"]:
+            add(f"  CONFIG NOTE: {note}")
 
     # --- outcomes ----------------------------------------------------------
     add("")

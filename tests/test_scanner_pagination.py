@@ -214,14 +214,28 @@ def test_empty_first_page_stops_immediately():
     assert result.candidates == SEEDS
 
 
-def test_short_page_stops_before_next_request():
-    client = _client_returning({0: _page(1, 20), 50: _page(100, 50)})
+def test_short_page_does_not_end_discovery_by_itself():
+    """
+    A short page means the server clipped it, NOT necessarily that the
+    leaderboard ran out -- treating it as end-of-data silently truncated the
+    candidate pool (the reported "changed the limit, still 30 candidates" bug).
+    Discovery now continues until an authoritative signal: an empty page, a
+    repeated page, the page cap, the budget, or an API error.
+    """
+    client = _client_returning({0: _page(1, 20), 20: _page(100, 50)})
 
     result = discover_candidates(client, limit=120, page_size=50, max_pages=10)
 
-    assert client.get_leaderboard.call_count == 1
-    assert result.stop_reason == "short_page"
-    assert len(result.candidates) == 30  # 20 leaderboard + 10 seeds
+    # offset advanced by the 20 rows actually returned (not by the 50 asked
+    # for), the next page returned 50 rows, and the walk only ended when the
+    # following page came back empty.
+    assert [c.kwargs["offset"] for c in client.get_leaderboard.call_args_list] == [0, 20, 70]
+    assert result.short_pages == 1
+    assert result.page_row_counts == [20, 50]
+    assert result.stop_reason == "empty_page"
+    assert result.leaderboard_candidates == 70
+    assert len(result.candidates) == 80          # 70 leaderboard + 10 seeds
+    assert len(set(result.candidates)) == 80
 
 
 def test_repeated_page_stops_pagination():
@@ -375,14 +389,42 @@ def test_offsets_advance_by_rows_returned_so_pages_cannot_overlap():
     assert result.stop_reason == "leaderboard_budget"
 
 
-def test_short_page_after_a_full_page_still_stops_the_walk():
-    client = _client_returning({0: _page(1, 30), 30: _page(31, 5)})
+def test_short_pages_are_walked_until_the_page_cap_bounds_them():
+    """Short pages never loop forever: the page cap is the backstop."""
+    client = _client_returning({0: _page(1, 30), 30: _page(31, 5), 35: _page(40, 5)})
+
+    result = discover_candidates(client, limit=200, page_size=30, max_pages=3)
+
+    assert client.get_leaderboard.call_count == 3      # exactly the page cap
+    assert result.stop_reason == "page_cap"
+    assert result.short_pages == 2
+    assert result.leaderboard_candidates == 40
+
+
+def test_short_page_followed_by_an_empty_page_stops():
+    client = _client_returning({0: _page(1, 20), 20: []})
 
     result = discover_candidates(client, limit=200, page_size=30, max_pages=5)
 
-    assert client.get_leaderboard.call_count == 2      # no third request
-    assert result.stop_reason == "short_page"
-    assert result.leaderboard_candidates == 35
+    assert client.get_leaderboard.call_count == 2
+    assert result.stop_reason == "empty_page"
+    assert result.short_pages == 1
+    assert result.page_row_counts == [20]
+
+
+def test_short_page_walk_never_counts_a_wallet_twice():
+    """A server that clips pages AND overlaps them must not double-count."""
+    client = _client_returning({
+        0: _page(1, 20),
+        20: _page(11, 20),        # 10 already seen + 10 new
+        40: [],
+    })
+
+    result = discover_candidates(client, limit=200, page_size=50, max_pages=5)
+
+    assert len(result.candidates) == len(set(result.candidates))
+    assert result.duplicates_dropped == 10
+    assert result.leaderboard_candidates == 30
 
 
 def test_seed_reservation_is_skipped_when_cap_is_smaller_than_the_seed_list():

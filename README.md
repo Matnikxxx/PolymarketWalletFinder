@@ -183,11 +183,16 @@ Phase 7 frequency analysis (`analytics/frequency_models.py`, `analytics/frequenc
   50, enforced by the scanner regardless of configuration) for at most
   `MAX_LEADERBOARD_PAGES` requests.
 - Pagination stops as soon as: the page cap is reached, an empty page comes
-  back, a short page comes back (fewer rows than requested = leaderboard
-  exhausted), a page repeats a page already seen, an API request fails, or
-  `MAX_WALLET_CANDIDATES` candidates have been collected. Attempted requests
-  are counted, including the one that failed, and the loop is bounded by the
-  page cap so it can never spin.
+  back, a page repeats a page already seen (the API ignoring `offset`), an API
+  request fails, or the candidate budget is filled. Attempted requests are
+  counted, including the one that failed, and the loop is bounded by the page
+  cap so it can never spin.
+- A **short page does not end the walk.** A server that clips a 50-row request
+  to 20 rows is not the same signal as the leaderboard running out, and
+  treating it as the end silently truncated the pool (raising
+  `MAX_WALLET_CANDIDATES` appeared to do nothing). Short pages are walked
+  through and counted; the empty page / repeated page / page cap / budget are
+  the authoritative stops.
 - Every address is validated against `^0x[a-fA-F0-9]{40}$` and normalized to
   lowercase. Rows that fail validation are skipped individually (and counted)
   -- one malformed row never aborts a scan.
@@ -379,5 +384,22 @@ work on this repo should follow.
   scanned wallet costs up to `MAX_HISTORY_PAGES` activity pages plus up to
   `MAX_HISTORY_PAGES` closed-position pages (both stop early on a short page),
   so a larger pool means proportionally more API requests per scan. Watch the
-  diagnostics' "pages attempted" and the `stop reason` to see what the pool
-  size is actually buying you.
+  diagnostics' "pages attempted", "rows per page" and `stop reason` to see what
+  the pool size is actually buying you.
+- **If a changed setting appears to have no effect**, the diagnostics say why.
+  `SCAN DIAGNOSTICS` prints a "Configuration in force" block with each
+  discovery setting's *effective value and source* (`.env`, `process
+  environment`, or `default`), plus any `CONFIG ISSUE`. The three most common
+  causes are reported explicitly:
+  1. a variable exported in your shell/IDE wins over `.env` (python-dotenv's
+     `override=False` default -- deliberate, so CI variables win; the report
+     names the conflict),
+  2. a value that cannot be parsed (`"100"` with quotes, `100 # comment`,
+     `abc`) falls back to the default -- now with a loud `CONFIG ISSUE` instead
+     of silently,
+  3. the configured limit exceeding what the page cap can reach (e.g.
+     `MAX_WALLET_CANDIDATES=1000` with `MAX_LEADERBOARD_PAGES=10` and
+     `LEADERBOARD_PAGE_SIZE=50` tops out at 500 rows + seeds) -- reported with
+     the exact arithmetic and which knob to raise.
+  Values written as `"100"`, `100 # comment` or `100.0` are now parsed
+  correctly; only genuine garbage falls back to the default.

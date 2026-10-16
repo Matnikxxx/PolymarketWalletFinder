@@ -13,8 +13,12 @@ Phase B behaviour
   skipped individually -- a single bad row never aborts a scan.
 * Candidates are de-duplicated globally across pages and seed wallets.
 * Leaderboard ordering is preserved and valid seeds are appended afterwards.
-* Pagination stops safely on: empty page, short page, repeated page, API
-  error, page cap, or once the overall candidate limit is reached.
+* Pagination stops safely on: empty page, repeated page (the API ignoring
+  `offset`), API error, page cap, or once the overall candidate limit is
+  reached. A *short* page does NOT end the walk -- the server clipping a page
+  is not the same as the leaderboard running out, and treating it as the end
+  silently truncated the candidate pool. Short pages are counted
+  (`short_pages`, `page_row_counts`) so the diagnostics show them.
 * The overall limit (``MAX_WALLET_CANDIDATES``) covers the union of
   leaderboard and seed candidates. A healthy leaderboard can therefore fill
   the whole pool on its own; seeds are then only a fallback for when the
@@ -98,6 +102,16 @@ class DiscoveryResult:
     duplicates_dropped: int = 0
     seed_duplicates: int = 0
     leaderboard_budget: int = 0
+    # Rows returned per page (in request order). A page shorter than the rows
+    # requested is *not* treated as end-of-data any more -- it usually means the
+    # server clipped the page, not that the leaderboard ran out -- so these are
+    # reported instead of acting on them.
+    page_row_counts: list = field(default_factory=list)
+    short_pages: int = 0
+    # Truthful notes about configuration reachability, surfaced by the scan
+    # diagnostics (e.g. "the configured limit cannot be reached with this page
+    # cap").
+    notes: list = field(default_factory=list)
     # address -> "leaderboard" | "seed" (which source produced it)
     sources: dict[str, str] = field(default_factory=dict)
 
@@ -199,6 +213,19 @@ def discover_candidates(
     except (TypeError, ValueError):
         page_cap = settings.MAX_LEADERBOARD_PAGES
 
+    # How many candidates the current page cap can physically reach. Reported
+    # rather than silently capping: if this is below the configured limit the
+    # user needs to know which knob is the binding one.
+    max_reachable = min(result.leaderboard_budget, page_cap * page_stride) + len(valid_seeds)
+    if max_reachable < limit:
+        note = (
+            f"MAX_WALLET_CANDIDATES={limit} is not reachable with the current pagination: "
+            f"at most {page_cap} page(s) x {page_stride} row(s) + {len(valid_seeds)} seed(s) "
+            f"= {max_reachable} candidate(s). Raise MAX_LEADERBOARD_PAGES to reach more."
+        )
+        result.notes.append(note)
+        logger.warning("WALLET_DISCOVERY_LIMIT_UNREACHABLE %s", note)
+
     seen: set[str] = set()
     page_signatures: set[tuple[str, ...]] = set()
     offset = 0
@@ -249,6 +276,7 @@ def discover_candidates(
             break
 
         result.rows_returned += len(raw_board)
+        result.page_row_counts.append(len(raw_board))
 
         page_addresses: list[str] = []
         for raw in raw_board:
@@ -290,9 +318,15 @@ def discover_candidates(
             break
 
         if len(raw_board) < request_limit:
-            # Fewer rows than requested -> the leaderboard is exhausted.
-            result.stop_reason = "short_page"
-            break
+            # Fewer rows than requested. This used to END discovery, which
+            # silently truncated the pool whenever the server clipped a page
+            # (e.g. 20 rows returned for a 50-row request) instead of the
+            # leaderboard actually running out. Keep walking: the walk stays
+            # bounded by the page cap, the candidate budget, the repeated-page
+            # guard and the empty-page guard, all of which are authoritative
+            # end-of-data signals. Counting these pages makes server-side
+            # clipping visible in the diagnostics.
+            result.short_pages += 1
     else:
         if page_cap == 0:
             result.stop_reason = "page_cap_disabled"

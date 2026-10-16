@@ -52,6 +52,14 @@ wallets the user explicitly chooses to track.
 - Do not lower hard-filter thresholds or add leaderboard rotation to raise the
   PASS count. Report the rejection-reason counts and leave the decision to the
   user.
+- A short leaderboard page must never end discovery (it usually means the
+  server clipped the page, not that the data ran out). Empty page, repeated
+  page, page cap, budget and API errors are the authoritative stops.
+- Config values must never fail silently: unparseable values fall back to the
+  default AND are recorded in `config.settings.CONFIG_ISSUES`, which the scan
+  diagnostics print. An exported variable overriding `.env` is reported too
+  (python-dotenv's `override=False` is deliberate; do not flip it without
+  saying so).
 - Do not commit `.env`, credentials, local logs, or user data.
 
 ## Change workflow
