@@ -25,7 +25,13 @@ def evaluate_position_eligibility(
     Evaluates a single PositionRecord against the approved Phase 6 rules.
     Guarantees assignment to exactly one bucket via a strict priority cascade.
     """
+    # Normalize a non-string timestamp to None. Ordering/parsing helpers treat
+    # a missing timestamp as "unknown" (e.g. drawdown becomes undefined rather
+    # than raising TypeError when a mixed str/int set is sorted); valid data is
+    # unaffected because build_position_records() emits ISO strings.
     effective_ts = pos.closed_at or pos.resolved_at or pos.opened_at
+    if effective_ts is not None and not isinstance(effective_ts, str):
+        effective_ts = None
 
     # Priority 1: Combos
     if pos.is_combo:

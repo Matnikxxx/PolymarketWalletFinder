@@ -22,18 +22,30 @@ def _format_gap(seconds):
     return f"{seconds/86400:.1f}d"
 
 
-def print_wallet_ranking(cards: list[WalletScoreCard]) -> None:
+def print_wallet_ranking(cards: list[WalletScoreCard], provisional_wallets=None) -> None:
     """
     Readable PowerShell-friendly ranking table (spec item 9). Rank number,
     ROI, win rate, drawdown, distinct-position count, avg size,
     consistency, risk, trading-frequency classification, median gap
     between trades, and the final explainable score + recommendation.
+
+    ``provisional_wallets`` (D3): wallets whose PASS was computed on a
+    page-capped history. Their RECOMMENDED label is shown as PROVISIONAL so
+    the console never claims more confidence than the stored record has.
+    Ranking itself is untouched -- only the printed label changes.
     """
+    provisional = set(provisional_wallets or ())
+
+    def _label(card: WalletScoreCard) -> str:
+        if card.recommendation == "RECOMMENDED" and card.wallet in provisional:
+            return "PROVISIONAL"
+        return card.recommendation
+
     rows = [
         [i + 1, c.wallet[:12] + "...", f"{c.roi_pct:.1f}%", f"{c.win_rate_pct:.1f}%", f"{c.drawdown_pct:.1f}%",
          c.num_positions, f"${c.avg_position_size:.2f}", c.consistency_score, c.risk_score,
          c.frequency_classification, _format_gap(c.frequency_median_gap_seconds),
-         c.final_score, c.recommendation]
+         c.final_score, _label(c)]
         for i, c in enumerate(cards)
     ]
     headers = [
@@ -46,6 +58,12 @@ def print_wallet_ranking(cards: list[WalletScoreCard]) -> None:
         "Risk", "Frequency", "Median Gap", "Score", "Recommendation",
     ]
     print(tabulate(rows, headers=headers))
+    if provisional:
+        print(
+            "  PROVISIONAL = PASS on PARTIAL history: every threshold is met on the "
+            "fetched window, but older activity was not fetched, so this is not a "
+            "fully-vetted RECOMMENDED."
+        )
 
 
 def print_dashboard(data) -> None:
@@ -115,13 +133,24 @@ def print_wallet_report(wallet_table: list[dict]) -> None:
             f"${w['total_volume']:.2f}" if w["total_volume"] is not None else "N/A",
             w["frequency_classification"] or "N/A",
             w["data_quality"],
+            w.get("active_days") if w.get("active_days") is not None else "N/A",
+            w.get("history_status") or "UNKNOWN",
             "yes" if w["tracked"] else "no",
         ])
     headers = [
         "Wallet", "Score", "Recommendation", "Win Rate", "ROI", "Drawdown", "Positions",
-        "Total Trades", "Buys", "Sells", "Volume", "Frequency", "Data Quality", "Tracked",
+        "Total Trades", "Buys", "Sells", "Volume", "Frequency", "Data Quality",
+        "Active Days", "History", "Tracked",
     ]
     print(tabulate(rows, headers=headers))
+    print(
+        "  N/A = not available/not computed for this wallet; 0 = a genuine measured zero. "
+        "History COMPLETE = the scan proved it fetched everything; "
+        "PARTIAL = a page cap left older data unfetched (active days are a lower bound); "
+        "UNKNOWN = no pagination metadata stored yet. "
+        "PROVISIONAL = PASS on PARTIAL history (all thresholds met on the fetched "
+        "window; older data unseen; never RECOMMENDED)."
+    )
 
 
 def print_verification(results: list[VerificationResult]) -> None:

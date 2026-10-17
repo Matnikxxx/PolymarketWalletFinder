@@ -32,7 +32,7 @@ from analytics.frequency import RollingWindowTracker
 from polymarket.api_client import PolymarketApiClient
 from polymarket.market_client import get_market_info
 from polymarket.wallet_activity import dedupe_new_events, fetch_wallet_events
-from storage import load_json, save_json_atomic
+from storage import load_json, load_wallet_state, save_json_atomic
 
 logger = logging.getLogger("wallet.monitor")
 
@@ -48,20 +48,31 @@ def _parse_event_ts(ts: Optional[str]) -> Optional[datetime]:
 
 def load_wallet_config(path: Optional[Path] = None) -> list[dict]:
     """
+    Load the persisted wallet records.
+
     `path` defaults to `settings.WALLETS_FILE`, resolved at CALL time (not
     import time) -- a plain `path: Path = settings.WALLETS_FILE` default
     would bake in whatever WALLETS_FILE was when this module was first
     imported, so changing settings.WALLETS_FILE later (e.g. in tests via
     monkeypatch) would silently have no effect.
+
+    Strict on purpose: a missing file means "no wallets yet", but a file
+    that exists and cannot be parsed raises ``WalletStateError`` (after a
+    byte-identical backup is written) instead of masquerading as empty.
+    Returning ``[]`` here would let the next scan overwrite tracked flags,
+    notes and records.
     """
-    data = load_json(path if path is not None else settings.WALLETS_FILE, default=[])
-    if not isinstance(data, list):
-        return []
-    return [w for w in data if isinstance(w, dict)]
+    return load_wallet_state(path if path is not None else settings.WALLETS_FILE)
 
 
 def save_wallet_config(wallets: list[dict], path: Optional[Path] = None) -> None:
-    save_json_atomic(path if path is not None else settings.WALLETS_FILE, wallets)
+    target = path if path is not None else settings.WALLETS_FILE
+    # Defence in depth: never replace an existing file that cannot be parsed.
+    # The scan loads state before doing any work, but this guard also covers
+    # any future caller (and a file corrupted between load and save).
+    if Path(target).exists():
+        load_wallet_state(target)
+    save_json_atomic(target, wallets)
 
 
 def wallet_address_key(value) -> str:

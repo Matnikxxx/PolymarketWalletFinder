@@ -60,6 +60,24 @@ wallets the user explicitly chooses to track.
   diagnostics print. An exported variable overriding `.env` is reported too
   (python-dotenv's `override=False` is deliberate; do not flip it without
   saying so).
+- `MAX_HISTORY_PAGES` (default 30) bounds each history feed: 100 fills per
+  activity page, 50 rows per closed-positions page. It is our own safety bound,
+  never describe it as a Polymarket API limit.
+- History completeness must be derived from *how the fetch ended*, not from the
+  loop finishing: a short/empty page (`exhausted`) proves completeness; a full
+  final page at the cap (`page_cap`) or a failed best-effort page
+  (`api_error`) means truncated. Pass this through as
+  `compute_wallet_statistics(is_complete_history=...)` so a truncated wallet is
+  `PARTIAL`, never `SUFFICIENT`.
+- Missing evidence is not negative evidence: when the exit history is
+  incomplete, `is_resolution_only` must be `None` (unknown), never `True`. An
+  observed `TRADING_EXIT` still proves `False`.
+- Completeness is reporting metadata, not a filter input: `filter_wallet()` must
+  not read `retrieval_status`/`is_complete_history`, and a cap must never be
+  raised automatically to make a wallet qualify.
+- The dashboard/report must distinguish a genuine zero (e.g. `active_days: 0`)
+  from an unknown value (`None` -> `N/A`), and must show legacy records with no
+  metadata as `UNKNOWN` rather than assuming completeness.
 - Do not commit `.env`, credentials, local logs, or user data.
 
 ## Change workflow

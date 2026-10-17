@@ -27,6 +27,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
+from analytics.consistency import consistency_score_from_dispersion
 from config.settings import CONFIG_ISSUES, settings, setting_source
 from tabulate import tabulate
 from wallet.scanner import SEED_CANDIDATE_WALLETS
@@ -68,11 +69,82 @@ class CandidateRow:
     consistency: Optional[float] = None
     drawdown_pct: Optional[float] = None
     frequency: Optional[str] = None
+    # History retrieval completeness for this candidate (P4):
+    #   "COMPLETE" -- a short/empty page proved the history was fully fetched
+    #   "PARTIAL"  -- a page cap (or failed request) left older data unfetched
+    #   "UNKNOWN"  -- no pagination metadata (mock/wrapper, or a stale refresh)
+    history_status: str = "UNKNOWN"
+    # Human-readable per-endpoint detail lines (endpoint, stop reason,
+    # pages, records) -- empty when metadata is unavailable.
+    history_detail: list = field(default_factory=list)
+    # Dated activity range, when the engine observed any.
+    first_activity_at: Optional[str] = None
+    last_activity_at: Optional[str] = None
+    # Endpoints whose history was NOT fully fetched (e.g. ["/closed-positions"]).
+    truncated_feeds: list = field(default_factory=list)
     reason: str = ""
     # Filter criteria this candidate failed (0 for PASS). INSUFFICIENT_DATA
     # rows count their missing criteria instead, so "how far off" is honest
     # for both outcomes.
     failed_criteria: list = field(default_factory=list)
+    # History-dependent criteria that could not be decided because the
+    # history was PARTIAL (empty for COMPLETE history). Distinct from
+    # "missing metric" criteria: the value exists, it just is not the
+    # wallet's lifetime value.
+    indeterminate_criteria: list = field(default_factory=list)
+
+
+#: Endpoint label -> persisted-field prefix used in wallets.json.
+_HISTORY_FEEDS = (
+    ("/activity", "activity"),
+    ("/closed-positions", "closed_positions"),
+)
+
+
+def describe_history_metadata(meta: Optional[dict]) -> tuple[str, list, list]:
+    """
+    Turn one wallet's persisted pagination metadata into
+    ``(status, detail_lines)``.
+
+    Status is COMPLETE only when the fetcher positively observed the end of
+    the history (a short/empty page) on every feed it could read. A page cap
+    or a failed request is PARTIAL. Missing metadata is UNKNOWN -- never
+    silently reported as complete.
+    """
+    if not isinstance(meta, dict):
+        return "UNKNOWN", [], []
+    truncated = meta.get("history_truncated")
+    status = "PARTIAL" if truncated is True else ("COMPLETE" if truncated is False else "UNKNOWN")
+
+    lines: list = []
+    truncated_feeds: list = []
+    for endpoint, prefix in _HISTORY_FEEDS:
+        stop = meta.get(f"{prefix}_stop_reason")
+        pages = meta.get(f"{prefix}_pages_fetched")
+        max_pages = meta.get(f"{prefix}_max_pages")
+        rows = meta.get(f"{prefix}_rows_fetched")
+        if stop is None and pages is None and rows is None:
+            continue
+        page_text = "?" if pages is None else str(pages)
+        if max_pages is not None:
+            page_text = f"{page_text}/{max_pages}"
+        row_text = "?" if rows is None else str(rows)
+        lines.append(
+            f"{endpoint}: {stop or 'unknown'} after {page_text} page(s), {row_text} record(s) fetched"
+        )
+        if meta.get(f"{prefix}_truncated") is True:
+            truncated_feeds.append(endpoint)
+    return status, lines, truncated_feeds
+
+
+def _history_label(row: "CandidateRow") -> str:
+    """Compact history label for the candidate table."""
+    if row.status == "STALE":
+        return "STALE"
+    if row.history_status == "PARTIAL":
+        feeds = "/".join(f.replace("/", "") for f in row.truncated_feeds)
+        return f"PARTIAL ({feeds})" if feeds else "PARTIAL"
+    return row.history_status
 
 
 @dataclass
@@ -103,12 +175,17 @@ class ScanSummary:
     # they are not conflated with hard-filter rejections.
     stale_causes: list = field(default_factory=list)
     insufficient_counts: Counter = field(default_factory=Counter)
+    # Criteria left undecidable by a PARTIAL history (D2/D3), counted
+    # separately from metrics that simply could not be computed.
+    indeterminate_counts: Counter = field(default_factory=Counter)
     frequency_counts: Counter = field(default_factory=Counter)
     frequency_penalized: int = 0
     frequency_bot_like: int = 0
     recommendation_counts: Counter = field(default_factory=Counter)
     ranked: int = 0
     rows: list[CandidateRow] = field(default_factory=list)
+    # History completeness split across all candidates (P4).
+    history_counts: Counter = field(default_factory=Counter)
     thresholds: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
@@ -125,6 +202,7 @@ def build_scan_summary(
     stale_causes: Optional[dict] = None,
     updates: Optional[list[dict]] = None,
     cards: Optional[list] = None,
+    history_meta: Optional[dict] = None,
 ) -> ScanSummary:
     """
     Build the summary from the pipeline's own objects. Every argument is read
@@ -137,6 +215,12 @@ def build_scan_summary(
     stale_causes = dict(stale_causes or {})
     updates = list(updates or [])
     cards = list(cards or [])
+    # Persisted pagination metadata per wallet (P1/P4): {address: {...}}.
+    history_meta_by_key = {
+        str(k).strip().lower(): v
+        for k, v in (history_meta or {}).items()
+        if isinstance(v, dict)
+    }
 
     summary = ScanSummary(candidates_total=len(wallets))
     summary.ranked = len(cards)
@@ -207,11 +291,22 @@ def build_scan_summary(
             mean = getattr(stats, "consistency_mean_roi", None)
             stdev = getattr(stats, "consistency_stdev_roi", None)
             if mean is not None and stdev is not None and mean != 0:
+                # Display-only rounding; the mean==0 case stays None here,
+                # exactly as before.
                 row.consistency = round(
-                    max(0.0, min(10.0, 10.0 / (1.0 + abs(stdev / mean)))), 2
+                    consistency_score_from_dispersion(mean, stdev), 2
                 )
         if freq is not None:
             row.frequency = getattr(freq, "classification", None)
+
+        # History retrieval completeness (P4). Missing metadata is UNKNOWN --
+        # it is never reported as complete just because the scan finished.
+        row.history_status, row.history_detail, row.truncated_feeds = describe_history_metadata(
+            history_meta_by_key.get(key)
+        )
+        if stats is not None:
+            row.first_activity_at = getattr(stats, "first_activity_at", None)
+            row.last_activity_at = getattr(stats, "last_activity_at", None)
 
         if result is not None:
             row.status = getattr(result, "status", "UNKNOWN")
@@ -224,6 +319,9 @@ def build_scan_summary(
         summary.status_counts[row.status] += 1
 
         if result is not None:
+            row.indeterminate_criteria = list(
+                getattr(result, "indeterminate_criteria", []) or []
+            )
             if row.status == "FAIL":
                 row.failed_criteria = [
                     reason for reason in (getattr(result, "reasons", []) or [])
@@ -248,8 +346,13 @@ def build_scan_summary(
                     variants.append(reason)
             for criterion in list(getattr(result, "insufficient_criteria", []) or []):
                 summary.insufficient_counts[criterion] += 1
+            for criterion in list(getattr(result, "indeterminate_criteria", []) or []):
+                summary.indeterminate_counts[criterion] += 1
 
         if row.status == "STALE":
+            # A failed refresh observed nothing this run: whatever was stored
+            # describes an earlier refresh, so completeness is unknown here.
+            row.history_status = "UNKNOWN"
             causes = [str(c) for c in (stale_causes.get(key) or [])] or ["(cause not supplied)"]
             summary.stale_causes.append({
                 "wallet": key,
@@ -262,6 +365,7 @@ def build_scan_summary(
         if row.frequency:
             summary.frequency_counts[row.frequency] += 1
 
+        summary.history_counts[row.history_status] += 1
         summary.rows.append(row)
 
     # --- near-miss analysis (read-only: derived from the filter's own output) ---
@@ -400,11 +504,45 @@ def format_scan_summary(summary: ScanSummary) -> str:
             for variant in variants:
                 prefix = "        e.g. " if single else "         - "
                 add(f"{prefix}{variant}")
+    # Which active-day rejections rest on a truncated window? (P4)
+    active_day_truncated = [
+        row for row in summary.rows
+        if row.status == "FAIL"
+        and row.history_status == "PARTIAL"
+        and any("active days" in reason for reason in (row.failed_criteria or []))
+    ]
+    if active_day_truncated:
+        add("")
+        add(
+            f"  NOTE: {len(active_day_truncated)} 'active days' rejection(s) involve PARTIAL history."
+        )
+        add(
+            "        Their day count is a lower bound over the fetched window -- the wallet may"
+        )
+        add(
+            "        be more active than MIN_ACTIVE_DAYS requires, but that cannot be shown"
+        )
+        add("        without a deeper fetch (raise MAX_HISTORY_PAGES):")
+        for row in active_day_truncated:
+            add(f"          {row.wallet[:12]}...  active_days={row.active_days} (lower bound)")
+
     if summary.insufficient_counts:
         add("")
         add("Missing/inconclusive criteria (INSUFFICIENT_DATA):")
         for criterion, count in summary.insufficient_counts.most_common():
             add(f"  {count:>3}  {criterion}")
+
+    # D2: on PARTIAL history, a missed history-dependent threshold is
+    # indeterminate rather than failed. Name the criteria explicitly.
+    if summary.indeterminate_counts:
+        add("")
+        add("Indeterminate criteria (PARTIAL history -- fetched window cannot decide):")
+        for criterion, count in summary.indeterminate_counts.most_common():
+            add(f"  {count:>3}  {criterion}")
+        affected = [row for row in summary.rows if row.indeterminate_criteria]
+        add(f"  NOTE: {len(affected)} candidate(s) had at least one criterion left undecided")
+        add("        by missing older history. These are NOT treated as FAIL reasons;")
+        add("        fetch deeper history (raise MAX_HISTORY_PAGES) to decide them.")
 
     # --- frequency ---------------------------------------------------------
     if summary.frequency_counts:
@@ -450,6 +588,47 @@ def format_scan_summary(summary: ScanSummary) -> str:
         add("STALE refreshes (previous metrics/scores kept, excluded from ranking):")
         for entry in summary.stale_causes:
             add(f"  {entry['wallet'][:12]}...: {'; '.join(entry['causes'])}")
+
+    # --- history retrieval completeness (P4) -------------------------------
+    if summary.history_counts:
+        total_hist = sum(summary.history_counts.values())
+        partial = summary.history_counts.get("PARTIAL", 0)
+        complete = summary.history_counts.get("COMPLETE", 0)
+        unknown = summary.history_counts.get("UNKNOWN", 0)
+        add("")
+        add("History retrieval completeness (newest-first, capped by MAX_HISTORY_PAGES):")
+        add(
+            f"  COMPLETE: {complete}   PARTIAL: {partial}   UNKNOWN: {unknown}   "
+            f"(of {total_hist} candidate(s))"
+        )
+        if partial:
+            add(
+                "  PARTIAL means older data was NOT fetched, so active days and lifetime"
+            )
+            add("  metrics for these wallets are LOWER BOUNDS, not measured totals:")
+            for row in summary.rows:
+                if row.history_status != "PARTIAL":
+                    continue
+                add(f"    {row.wallet[:12]}...  {row.status}")
+                for line in row.history_detail:
+                    add(f"      {line}")
+        if unknown:
+            add(
+                "  UNKNOWN means no pagination metadata was available for this run"
+                " (mock/wrapper or a stale refresh); it is never assumed complete."
+            )
+
+    # --- activity window (P4) ----------------------------------------------
+    dated = [r for r in summary.rows if r.active_days is not None or r.first_activity_at or r.last_activity_at]
+    if dated:
+        add("")
+        add("Observed activity window (per candidate; 0 days = a measured zero, N/A = unavailable):")
+        for row in dated:
+            days = "N/A" if row.active_days is None else f"{row.active_days} day(s)"
+            first = (row.first_activity_at or "N/A")[:10]
+            last = (row.last_activity_at or "N/A")[:10]
+            suffix = "  [PARTIAL history: lower bound]" if row.history_status == "PARTIAL" else ""
+            add(f"  {row.wallet[:12]}...  {days:<12} {first} .. {last}{suffix}")
 
     # --- thresholds --------------------------------------------------------
     t = summary.thresholds
@@ -511,6 +690,7 @@ def format_candidate_table(summary: ScanSummary) -> str:
         rows.append([
             row.wallet[:12] + "...",
             row.status,
+            _history_label(row),
             row.source,
             fmt(row.roi_pct),
             fmt(row.win_rate_pct),
@@ -519,13 +699,20 @@ def format_candidate_table(summary: ScanSummary) -> str:
             fmt(row.consistency),
             fmt(row.drawdown_pct),
             row.frequency or "N/A",
-            (row.reason[:44] + "...") if len(row.reason) > 47 else row.reason,
+            (row.reason[:40] + "...") if len(row.reason) > 43 else row.reason,
         ])
     headers = [
-        "Wallet", "Status", "Source", "ROI%", "WinRate%", "Pos", "Days", "Cons", "DD%",
-        "Frequency", "Primary reason",
+        "Wallet", "Status", "History", "Source", "ROI%", "WinRate%", "Pos", "Days",
+        "Cons", "DD%", "Frequency", "Primary reason",
     ]
-    return tabulate(rows, headers=headers)
+    table = tabulate(rows, headers=headers)
+    return (
+        table
+        + "\nLegend: N/A = not available/not computed for this wallet this scan; "
+        "0 = a genuine measured zero (e.g. 0 positions)."
+        + "\n        History COMPLETE = a short/empty page proved the history ended; "
+        "PARTIAL = a page cap left older data unfetched."
+    )
 
 
 def print_scan_summary(summary: ScanSummary) -> None:

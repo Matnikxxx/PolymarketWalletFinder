@@ -21,6 +21,7 @@ from flask import Flask, render_template
 
 from analytics.dashboard import build_dashboard_data
 from config.settings import settings
+from storage import WalletStateError
 
 
 def create_app() -> Flask:
@@ -32,7 +33,17 @@ def create_app() -> Flask:
         # auto-refresh) always reflects the current on-disk state -- and
         # reading state never starts or restarts wallet tracking (that
         # only happens via a separate `--track-wallets` process).
-        data = build_dashboard_data()
+        try:
+            data = build_dashboard_data()
+        except WalletStateError as exc:
+            # 500, not an empty-but-successful page: a broken state file is
+            # an error, and the message names the file and the backup copy.
+            return render_template(
+                "error.html",
+                error=str(exc),
+                error_path=str(exc.path),
+                backup_path=str(exc.backup_path) if exc.backup_path else None,
+            ), 500
         return render_template(
             "index.html",
             data=data,

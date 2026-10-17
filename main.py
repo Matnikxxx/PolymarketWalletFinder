@@ -16,8 +16,10 @@ from datetime import datetime, timezone
 from config.settings import settings
 from polymarket.api_client import PolymarketApiClient, ApiError
 from polymarket.wallet_activity import fetch_wallet_events, fetch_wallet_events_paginated
+from polymarket.pagination import history_is_complete, pagination_of
 from analytics.models import WalletStatistics
 from analytics.frequency_models import FrequencyProfile
+from analytics.consistency import consistency_score_from_dispersion
 from analytics.performance import compute_wallet_statistics, build_position_records
 from analytics.frequency import (
     compute_frequency_profile,
@@ -44,6 +46,7 @@ from wallet.monitor import (
 from monitor.status import print_wallet_ranking, print_verification, print_dashboard, print_wallet_report
 from monitor.scan_report import build_scan_summary, print_scan_summary
 from analytics.dashboard import build_dashboard_data
+from storage import WalletStateError
 
 logger = logging.getLogger("main")
 
@@ -100,6 +103,24 @@ PRESERVED_ON_INCOMPLETE_REFRESH = (
     "active_positions",
     "portfolio_value",
     "last_activity_at",
+    "first_activity_at",
+    "active_days",
+    # Retrieval-completeness facts describe the last SUCCESSFUL refresh; a
+    # failed refresh must not overwrite them with values it could not observe.
+    "history_truncated",
+    "activity_truncated",
+    "closed_positions_truncated",
+    "activity_pages_fetched",
+    "closed_positions_pages_fetched",
+    "activity_rows_fetched",
+    "closed_positions_rows_fetched",
+    "activity_max_pages",
+    "closed_positions_max_pages",
+    "activity_stop_reason",
+    "closed_positions_stop_reason",
+    # The confidence explanation belongs to the last successful refresh too.
+    "hard_filter_indeterminate_criteria",
+    "history_note",
 )
 
 
@@ -169,7 +190,9 @@ def _stale_wallet_update(
     return update
 
 
-def _fresh_data_quality(stats, closed_rows_returned: bool) -> tuple[str, str, str]:
+def _fresh_data_quality(
+    stats, closed_rows_returned: bool, history_note: str | None = None,
+) -> tuple[str, str, str]:
     """
     Honest ``(data_quality, data_quality_reason, pnl_source)`` for a wallet
     whose closed-positions refresh SUCCEEDED.
@@ -185,29 +208,100 @@ def _fresh_data_quality(stats, closed_rows_returned: bool) -> tuple[str, str, st
     """
     counted = stats.positions_counted
     if counted <= 0:
-        return (
+        quality, reason, source = (
             stats.retrieval_status,
             "Closed-positions request succeeded but returned no eligible closed positions; "
             "no ROI, win rate or realized P&L is published from an empty history.",
             "none",
         )
-    if not closed_rows_returned:
-        return (
+    elif not closed_rows_returned:
+        quality, reason, source = (
             "ACTIVITY_ONLY",
             f"Closed-positions API returned an empty history; the {counted} eligible position(s) "
             "were reconstructed from /activity fills, so ROI/win-rate/realized P&L are our own "
             "reconstruction rather than authoritative closed-position accounting.",
             "activity_reconstruction",
         )
+    else:
+        quality, reason, source = (
+            stats.retrieval_status,
+            f"Win/loss, realized P&L, ROI, and drawdown computed from "
+            f"{counted} eligible position(s) via Phase 6 engine.",
+            "closed_positions_api",
+        )
+    if history_note:
+        reason = f"{reason} {history_note}"
+    return quality, reason, source
+
+
+def _history_metadata(events, closed_positions) -> dict:
+    """
+    Pagination-completeness fields for one wallet's refresh (P1).
+
+    A full final page at ``MAX_HISTORY_PAGES`` means older history was never
+    fetched; that is recorded explicitly instead of being reported as
+    complete because the fetch loop happened to end. Keys are only present
+    when the fetcher supplied metadata (the paginated helpers always do; a
+    plain-list caller or test double does not), so a merge can never replace
+    a previously stored observation with a guess.
+    """
+    activity = pagination_of(events)
+    closed = pagination_of(closed_positions)
+    meta: dict = {}
+    if activity is not None:
+        meta["activity_pages_fetched"] = activity.pages_fetched
+        meta["activity_max_pages"] = activity.max_pages
+        meta["activity_rows_fetched"] = activity.rows_fetched
+        meta["activity_truncated"] = activity.truncated
+        meta["activity_stop_reason"] = activity.stop_reason
+    if closed is not None:
+        meta["closed_positions_pages_fetched"] = closed.pages_fetched
+        meta["closed_positions_max_pages"] = closed.max_pages
+        meta["closed_positions_rows_fetched"] = closed.rows_fetched
+        meta["closed_positions_truncated"] = closed.truncated
+        meta["closed_positions_stop_reason"] = closed.stop_reason
+    if activity is not None or closed is not None:
+        meta["history_truncated"] = bool(
+            (activity is not None and activity.truncated)
+            or (closed is not None and closed.truncated)
+        )
+    return meta
+
+
+def _history_note(events, closed_positions) -> str | None:
+    """Human-readable explanation for a PARTIAL retrieval status (P1)."""
+    activity = pagination_of(events)
+    closed = pagination_of(closed_positions)
+    bits: list[str] = []
+    if activity is not None and activity.truncated:
+        bits.append(
+            f"/activity stopped at the {activity.max_pages}-page cap after "
+            f"{activity.rows_fetched} fill(s) (stop={activity.stop_reason}); "
+            "older activity is unseen"
+        )
+    if closed is not None and closed.truncated:
+        bits.append(
+            f"/closed-positions stopped at the {closed.max_pages}-page cap after "
+            f"{closed.rows_fetched} row(s) (stop={closed.stop_reason}); "
+            "older closed positions are unseen"
+        )
+    if not bits:
+        return None
     return (
-        stats.retrieval_status,
-        f"Win/loss, realized P&L, ROI, and drawdown computed from "
-        f"{counted} eligible position(s) via Phase 6 engine.",
-        "closed_positions_api",
+        "History is PARTIAL: " + "; ".join(bits) + ". "
+        "Active days and lifetime metrics are lower bounds."
     )
 
 
 def cmd_scan_wallets(args) -> None:
+    # Existing records are loaded BEFORE any discovery or network work, so a
+    # scan can merge into them instead of rebuilding the file: tracked
+    # preferences, hand-added wallets, custom fields and wallets that simply
+    # did not reappear on the leaderboard this time all survive a re-scan.
+    # It also means an unreadable state file aborts the scan before a single
+    # API call or write -- it is never treated as "no wallets yet".
+    existing_records = load_wallet_config()
+
     client = PolymarketApiClient()
     wallets = scan_top_wallets(client, limit=settings.MAX_WALLET_CANDIDATES)
     # Discovery counters (pages attempted/succeeded, rows, validation and
@@ -217,11 +311,6 @@ def cmd_scan_wallets(args) -> None:
     discovery_sources = dict(getattr(discovery, "sources", {}) or {})
     refresh_attempt_at = _utc_now_iso()
 
-    # Existing records are loaded BEFORE anything is written, so a scan can
-    # merge into them instead of rebuilding the file: tracked preferences,
-    # hand-added wallets, custom fields and wallets that simply did not
-    # reappear on the leaderboard this time all survive a re-scan.
-    existing_records = load_wallet_config()
     existing_by_key: dict[str, dict] = {}
     for record in existing_records:
         key = wallet_address_key(record)
@@ -238,6 +327,8 @@ def cmd_scan_wallets(args) -> None:
     stale_updates: dict[str, dict] = {}
     stale_wallets: list[str] = []
     stale_causes_map: dict[str, list[str]] = {}
+    history_meta_map: dict[str, dict] = {}
+    history_note_map: dict[str, str] = {}
 
     for w in wallets:
         short = w[:10] + "..."
@@ -294,13 +385,36 @@ def cmd_scan_wallets(args) -> None:
         endpoint_notes_map[w] = endpoint_notes
         closed_rows_returned_map[w] = bool(raw_closed)
 
+        # Pagination completeness (P1): a fetch that stopped on a full page at
+        # MAX_HISTORY_PAGES may have left older history unfetched. That is
+        # never inferred from "the loop ended" -- only a short/empty page
+        # proves completeness. The flag reaches the analytics engine so a
+        # truncated wallet can never be labelled SUFFICIENT, and is persisted
+        # so diagnostics/dashboard can show it.
+        history_meta_map[w] = _history_metadata(events, raw_closed)
+        note = _history_note(events, raw_closed)
+        if note:
+            history_note_map[w] = note
+        history_complete = (
+            history_is_complete(events)
+            and history_is_complete(raw_closed)
+            and not stale_reasons
+        )
+
         # Build canonical Phase 6 PositionRecords
         positions = build_position_records(raw_closed, events, raw_positions)
 
         # Compute canonical Phase 6 WalletStatistics. These are computed on
         # every scan for diagnostics, but are only PERSISTED for a refresh
         # that actually succeeded -- see the stale branch below.
-        stats = compute_wallet_statistics(w, positions)
+        stats = compute_wallet_statistics(
+            w, positions,
+            is_complete_history=history_complete,
+            # P2: when the SELL/exit history was truncated, a missing
+            # TRADING_EXIT is "unobserved", not "absent" -- the engine then
+            # reports is_resolution_only=None instead of rejecting the wallet.
+            exit_history_complete=history_complete,
+        )
         stats_map[w] = stats
 
         # Compute canonical Phase 7 FrequencyProfile
@@ -425,7 +539,12 @@ def cmd_scan_wallets(args) -> None:
     pass_stats = [stats_map[w] for w in pass_wallets]
     pass_freq = {w: freq_map[w] for w in pass_wallets}
     cards = rank_wallets(pass_stats, pass_freq)
-    print_wallet_ranking(cards)
+    # D3: PASS wallets whose history was page-capped are labelled PROVISIONAL
+    # on the console exactly as they will be stored.
+    print_wallet_ranking(
+        cards,
+        {w for w in pass_wallets if filter_map.get(w) and filter_map[w].history_note},
+    )
 
     updates: list[dict] = []
 
@@ -442,8 +561,19 @@ def cmd_scan_wallets(args) -> None:
             existing_by_key.get(card.wallet, {}), refresh_attempt_at,
             discovery_sources.get(card.wallet),
         ))
+        cfg.update(history_meta_map.get(card.wallet, {}))
         cfg["last_score"] = card.final_score
-        cfg["recommendation"] = card.recommendation
+        # D3 (PROVISIONAL policy): a PASS computed on a page-capped history is
+        # never presented as a fully-vetted RECOMMENDED. The score and the PASS
+        # itself are retained; only the confidence label is lowered. An
+        # already-cautious WATCH/REJECT (low score, bot-like) stays as the
+        # ranking produced it -- PROVISIONAL must never look better than the
+        # ranking's own caution, and ranking logic itself is untouched.
+        recommendation = card.recommendation
+        if filter_map.get(card.wallet) is not None and filter_map[card.wallet].history_note:
+            if recommendation == "RECOMMENDED":
+                recommendation = "PROVISIONAL"
+        cfg["recommendation"] = recommendation
         cfg["frequency_classification"] = card.frequency_classification
         cfg["frequency_median_gap_seconds"] = card.frequency_median_gap_seconds
 
@@ -460,10 +590,13 @@ def cmd_scan_wallets(args) -> None:
         cfg["hard_filter_status"] = fres.status if fres else "PASS"
         cfg["hard_filter_reasons"] = fres.reasons if fres else []
         cfg["hard_filter_insufficient_criteria"] = fres.insufficient_criteria if fres else []
+        cfg["hard_filter_indeterminate_criteria"] = fres.indeterminate_criteria if fres else []
+        cfg["history_note"] = fres.history_note if fres else None
 
         has_closed_data = stats.positions_counted > 0
         data_quality, quality_reason, pnl_source = _fresh_data_quality(
-            stats, closed_rows_returned_map.get(card.wallet, False)
+            stats, closed_rows_returned_map.get(card.wallet, False),
+            history_note_map.get(card.wallet),
         )
         cfg["data_quality"] = data_quality
         cfg["data_quality_reason"] = quality_reason
@@ -485,6 +618,12 @@ def cmd_scan_wallets(args) -> None:
         cfg["largest_trade"] = extra.get("largest_trade")
         cfg["active_positions"] = extra.get("active_positions")
         cfg["portfolio_value"] = extra.get("portfolio_value")
+        # Same source values as the FAIL branch, so the dashboard/report can
+        # show a PASS wallet's activity span too. active_days is the engine's
+        # measured integer (a genuine 0 stays 0); first_activity_at is None
+        # only when the engine observed no dated position at all.
+        cfg["active_days"] = stats.active_days
+        cfg["first_activity_at"] = stats.first_activity_at
         cfg["last_activity_at"] = stats.last_activity_at
         updates.append(cfg)
 
@@ -501,14 +640,18 @@ def cmd_scan_wallets(args) -> None:
         cfg.update(_candidate_history_fields(
             existing_by_key.get(w, {}), refresh_attempt_at, discovery_sources.get(w)
         ))
+        cfg.update(history_meta_map.get(w, {}))
         cfg["last_score"] = None
         cfg["recommendation"] = "HARD_FILTER_REJECT" if fres.status == "FAIL" else "HARD_FILTER_INSUFFICIENT_DATA"
         cfg["hard_filter_status"] = fres.status
         cfg["hard_filter_reasons"] = fres.reasons
         cfg["hard_filter_insufficient_criteria"] = fres.insufficient_criteria
+        cfg["hard_filter_indeterminate_criteria"] = fres.indeterminate_criteria
+        cfg["history_note"] = fres.history_note
         has_closed_data = stats.positions_counted > 0
         data_quality, quality_reason, pnl_source = _fresh_data_quality(
-            stats, closed_rows_returned_map.get(w, False)
+            stats, closed_rows_returned_map.get(w, False),
+            history_note_map.get(w),
         )
         cfg["data_quality"] = data_quality
         cfg["data_quality_reason"] = quality_reason
@@ -517,7 +660,34 @@ def cmd_scan_wallets(args) -> None:
             cfg["data_quality_reason"] += " " + " ".join(endpoint_notes_map[w])
         cfg["win_rate_pct"] = stats.win_rate_pct if has_closed_data else None
         cfg["roi_pct"] = stats.roi_fee_exclusive_pct if has_closed_data else None
+        # P3 (reporting only): persist the metrics that produced this
+        # FAIL / INSUFFICIENT_DATA decision so it can be audited from
+        # wallets.json, the dashboard and --report without re-running a scan.
+        # Every value is either computed by the same engine the filter used,
+        # or explicitly None -- a metric that could not be computed is never
+        # written as a misleading zero. None of these fields is read by
+        # filter_wallet() or score_wallet(), so the decision itself is
+        # unchanged.
+        cfg["num_positions"] = stats.positions_counted if has_closed_data else None
+        cfg["consistency_score"] = (
+            consistency_score_from_dispersion(
+                stats.consistency_mean_roi, stats.consistency_stdev_roi
+            )
+            if has_closed_data
+            else None
+        )
+        cfg["drawdown_pct"] = stats.drawdown_cost_pct if has_closed_data else None
+        cfg["realized_pnl"] = stats.total_settled_net_result if has_closed_data else None
+        cfg["avg_position_size"] = stats.mean_position_cost if has_closed_data else None
+        # active_days is always computed from observed position timestamps,
+        # including 0 when none were observed -- that 0 is the value the
+        # "Only N active days" reason is based on, not a placeholder.
+        cfg["active_days"] = stats.active_days
+        cfg["first_activity_at"] = stats.first_activity_at
         cfg["last_activity_at"] = stats.last_activity_at
+        cfg["total_trades"] = extra.get("total_trades")
+        cfg["buy_trades"] = extra.get("buy_trades")
+        cfg["sell_trades"] = extra.get("sell_trades")
         updates.append(cfg)
 
     # --- STALE wallets: previous metrics preserved, never overwritten -----
@@ -544,6 +714,7 @@ def cmd_scan_wallets(args) -> None:
         stale_causes=stale_causes_map,
         updates=updates,
         cards=cards,
+        history_meta=history_meta_map,
     )
     print_scan_summary(summary)
 
@@ -671,26 +842,36 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.scan_wallets:
-        cmd_scan_wallets(args)
-    elif args.verify_wallets:
-        cmd_verify_wallets(args)
-    elif args.track_wallets:
-        cmd_track_wallets(args)
-    elif args.status:
-        cmd_status(args)
-    elif args.report:
-        cmd_report(args)
-    elif args.dashboard:
-        cmd_dashboard(args)
-    elif args.dashboard_cli:
-        cmd_dashboard_cli(args)
-    elif args.reset:
-        cmd_reset(args)
-    else:
-        print("Polymarket Wallet Finder / Tracker")
-        print("Run with one of: --scan-wallets --verify-wallets --track-wallets --status --report --dashboard --dashboard-cli --reset")
-        print("Example: python main.py --scan-wallets")
+    # Exit code 2 = state/config error (distinct from a crash). The wallet
+    # file is left exactly as found and a recoverable backup was written.
+    try:
+        if args.scan_wallets:
+            cmd_scan_wallets(args)
+        elif args.verify_wallets:
+            cmd_verify_wallets(args)
+        elif args.track_wallets:
+            cmd_track_wallets(args)
+        elif args.status:
+            cmd_status(args)
+        elif args.report:
+            cmd_report(args)
+        elif args.dashboard:
+            cmd_dashboard(args)
+        elif args.dashboard_cli:
+            cmd_dashboard_cli(args)
+        elif args.reset:
+            cmd_reset(args)
+        else:
+            print("Polymarket Wallet Finder / Tracker")
+            print("Run with one of: --scan-wallets --verify-wallets --track-wallets --status --report --dashboard --dashboard-cli --reset")
+            print("Example: python main.py --scan-wallets")
+    except WalletStateError as exc:
+        logger.error(
+            "WALLET_STATE_ERROR path=%s reason=%s backup=%s",
+            exc.path, exc.reason, exc.backup_path or "-",
+        )
+        print(f"\nWALLET STATE ERROR\n{exc}", file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

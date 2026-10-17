@@ -384,7 +384,7 @@ def test_cmd_scan_wallets_multi_partitioning(
 
     orig_compute_stats = main.compute_wallet_statistics
 
-    def mocked_compute_stats(wallet, positions):
+    def mocked_compute_stats(wallet, positions, **kwargs):
         if wallet == w_insuf:
             return WalletStatistics(
                 wallet=w_insuf,
@@ -398,7 +398,7 @@ def test_cmd_scan_wallets_multi_partitioning(
                 is_resolution_only=None,  # triggers INSUFFICIENT_DATA
                 category_mix={"Crypto": 45},
             )
-        return orig_compute_stats(wallet, positions)
+        return orig_compute_stats(wallet, positions, **kwargs)
 
     with patch("main.compute_wallet_statistics", side_effect=mocked_compute_stats):
         with patch("main.load_wallet_config", return_value=[]):

@@ -28,8 +28,18 @@ from analytics.eligibility import partition_positions
 
 
 def _parse_utc_date(ts_str: Optional[str]) -> Optional[str]:
-    """Extracts UTC YYYY-MM-DD from an ISO timestamp string."""
-    if not ts_str:
+    """
+    Extracts UTC YYYY-MM-DD from an ISO timestamp string.
+
+    Returns None for anything that is not a non-empty string. The pipeline
+    normalizes numeric timestamps to ISO strings before building position
+    records (see build_position_records), so a non-string here means an
+    unexpected payload shape, not a date. Guarding on the type keeps one odd
+    record from aborting an entire scan with AttributeError ('int' object has
+    no attribute 'replace'); unparseable values are simply not counted as
+    active days, exactly as before for malformed strings.
+    """
+    if not isinstance(ts_str, str) or not ts_str:
         return None
     try:
         dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
@@ -96,9 +106,21 @@ def compute_wallet_statistics(
     reconciled: bool = True,
     as_of: Optional[str] = None,
     tolerance: float = 0.01,
+    exit_history_complete: Optional[bool] = None,
 ) -> WalletStatistics:
     """
     Computes all Phase 6 core statistics for a wallet based on the approved rules.
+
+    ``exit_history_complete`` states whether the SELL/exit side of the history
+    was fully retrieved (the /activity fills used to infer TRADING_EXIT). When
+    it is False, a missing trading exit can only mean "not observed", not
+    "does not exist": ``is_resolution_only`` is then reported as None
+    (unknown) rather than True, so the hard filter cannot reject a wallet for
+    an exit that merely fell outside the fetched window. It defaults to
+    ``is_complete_history``, so callers that already declare a truncated
+    history get the conservative behaviour automatically. An *observed*
+    trading exit still yields False even when the rest of the history is
+    truncated -- one exit is proof the wallet does trade out.
     """
     evaluations, accounting = partition_positions(positions, tolerance=tolerance)
     eligible = [e for e in evaluations if e.is_eligible]
@@ -167,11 +189,18 @@ def compute_wallet_statistics(
     distinct_dates = set()
     for p in positions:
         for ts in (p.opened_at, p.closed_at, p.resolved_at):
-            if ts:
+            if not ts:
+                continue
+            # Only strings can be compared/ordered as ISO timestamps. A
+            # non-string value is skipped for the reported activity window
+            # (min/max would otherwise raise TypeError on a mixed set) and is
+            # simply not counted as an active day. Valid data is unaffected:
+            # build_position_records() normalizes numeric timestamps first.
+            if isinstance(ts, str):
                 all_timestamps.append(ts)
-                d = _parse_utc_date(ts)
-                if d:
-                    distinct_dates.add(d)
+            d = _parse_utc_date(ts)
+            if d:
+                distinct_dates.add(d)
 
     active_days = len(distinct_dates)
     first_activity_at = min(all_timestamps) if all_timestamps else None
@@ -218,13 +247,26 @@ def compute_wallet_statistics(
     # If there are no positions at all (ordinary_positions == 0), we cannot
     # determine this reliably, so we leave it as None rather than guessing False.
     ordinary_positions = accounting.ordinary_positions
+    if exit_history_complete is None:
+        # Backwards-compatible default: an incomplete overall history is
+        # treated as an unverified exit history.
+        exit_history_complete = is_complete_history
     if ordinary_positions >= 3:
         has_trading_exit = any(
             p.settlement_type == PositionSettlementType.TRADING_EXIT
             for p in positions
             if not p.is_combo
         )
-        is_resolution_only: Optional[bool] = not has_trading_exit
+        if has_trading_exit:
+            # Observing one exit proves the wallet exits by trading, however
+            # truncated the rest of the history is.
+            is_resolution_only: Optional[bool] = False
+        elif not exit_history_complete:
+            # No exit was observed, but SELL fills may sit in the unfetched
+            # window. Absence of evidence is not evidence of absence.
+            is_resolution_only = None
+        else:
+            is_resolution_only = True
     elif ordinary_positions > 0:
         # Some positions but below the minimum count for a reliable determination.
         # Cannot declare resolution-only on thin history — leave None.

@@ -277,12 +277,20 @@ Each scanned record carries:
 | `first_seen_at` / `last_seen_at` | When this wallet was first discovered, and when a scan last rediscovered it. |
 | `times_seen` | How many scans have rediscovered it (a scan that fails to refresh it still counts -- it was seen). |
 | `discovery_source` | `leaderboard` or `seed` -- which input produced it. Kept from the last known source if unknown. |
+| `active_days` | Distinct UTC dates observed across opened/closed/resolved timestamps. A genuine `0` is a measurement; the field is absent on records written before it existed. **A lower bound when history is PARTIAL.** |
+| `first_activity_at` / `last_activity_at` | The earliest/latest timestamp observed in the retrieved history. |
+| `history_truncated` | `true` when a page cap (or a failed best-effort page) left older data unfetched, `false` when a short/empty page proved completeness. Absent on legacy records, which are shown as `UNKNOWN`. |
+| `activity_truncated` / `closed_positions_truncated` | Per-feed version of the above. |
+| `activity_stop_reason` / `closed_positions_stop_reason` | `exhausted`, `page_cap` or `api_error` -- why that feed's walk ended. |
+| `activity_pages_fetched` / `closed_positions_pages_fetched` (+ `..._max_pages`, `..._rows_fetched`) | Actual pages requested, the configured cap, and how many records came back -- see section 5f. |
 
 `data_quality` values:
 
 - **`SUFFICIENT`** / **`PARTIAL`** / **`INSUFFICIENT`** -- the closed-positions
   request succeeded; these are the Phase 6 retrieval statuses describing how
-  complete/eligible the retrieved history was.
+  complete/eligible the retrieved history was. `PARTIAL` is also what a wallet
+  whose history hit `MAX_HISTORY_PAGES` gets: the numbers are real arithmetic
+  over a truncated window, not a lifetime total (section 5f).
 - **`ACTIVITY_ONLY`** -- the request succeeded but the history was empty, and
   the numbers present were reconstructed from `/activity` fills. Never
   presented as authoritative closed-position accounting.
@@ -294,6 +302,203 @@ Each scanned record carries:
 A *successful but empty* history is **not** an error: it is reported as an
 empty/insufficient result (never `STALE`), and no ROI/win-rate/P&L is
 published from it.
+
+### PARTIAL history: PROVISIONAL and indeterminate criteria
+
+A page-capped history (`history_truncated: true`) changes how a decision is
+labelled -- never how it is computed. Thresholds, scoring formulas, ranking
+order and `MAX_HISTORY_PAGES` itself are untouched.
+
+| Situation | Outcome |
+| --- | --- |
+| **COMPLETE** history | Exactly as before: `PASS` / `FAIL` / `INSUFFICIENT_DATA`, the same score, and `RECOMMENDED` / `WATCH` / `REJECT`. |
+| **PARTIAL**, every threshold met on the fetched window | `PASS` + score, recommendation **`PROVISIONAL`** -- never `RECOMMENDED`. |
+| **PARTIAL**, only failures a truncated window could explain | `INSUFFICIENT_DATA`; the affected criteria (`roi`, `positions`, `active_days`, `consistency`, `concentration`) are reported as **indeterminate**, not as rejections. |
+| **PARTIAL**, an independent failure | `FAIL` for that reason only: drawdown above the maximum, a politics-heavy mix, or a confirmed resolution-only profile. A truncated-window metric is never presented as the decisive reason. |
+| **PARTIAL**, exit history unknown (no SELL observed) | `INSUFFICIENT_DATA` -- an unseen exit may sit in the unfetched window. |
+
+The explanation is persisted in `data/wallets.json` as `history_note` and
+`hard_filter_indeterminate_criteria`, is shown by `--report` (Recommendation
+column + legend), in the dashboard (dashed violet `PROVISIONAL` badge and an
+`indeterminate:` marker on the History cell), and in the scan diagnostics
+(`Indeterminate criteria (PARTIAL history ...)`). A later failed refresh keeps
+the last successful explanation verbatim. `PROVISIONAL` is deliberately
+visually distinct from both `WATCH` and `RECOMMENDED`; a wallet the ranking
+already marks `WATCH` or `REJECT` keeps that more cautious label.
+
+### Unreadable `data/wallets.json` (wallet-state safety)
+
+A **missing** file means "no wallets yet". A file that **exists but cannot be
+parsed is never treated as empty**, because the next scan would then rebuild it
+and silently destroy `tracked` flags, `my_note` annotations and
+`first_seen_at` history. Instead:
+
+- the CLI (`--scan-wallets`, `--report`, `--status`, `--track-wallets`,
+  `--verify-wallets`) logs `WALLET_STATE_ERROR`, prints the diagnostic to
+  stderr and exits **2**; the scan aborts **before any API call**;
+- the web dashboard returns **HTTP 500** with the same diagnostic instead of an
+  empty view;
+- a byte-identical copy is written next to the file as
+  `wallets.json.corrupt-<UTC>.bak` (reused if the same content is read again);
+- the original file is **never modified**. If the backup cannot be written, the
+  command still aborts without touching the original and the error says why.
+
+This covers invalid JSON, empty files, non-UTF-8 content, a non-array root,
+non-object entries and unreadable files (permissions, cloud placeholders).
+Non-critical files (`verification.json`, `data/wallet_activity_log.json`) stay
+best-effort and lenient.
+
+**Platform notes**
+
+- **Linux / macOS** -- the backup is created with mode `0600` (owner-only),
+  further restricted by the process umask. Wallet records contain addresses and
+  free-text notes, so they are not world-readable.
+- **Windows** -- POSIX mode bits do not map to NTFS ACLs; the backup inherits
+  the ACL of its parent directory like any other file. `0600` is still passed
+  for consistency, but treat the **folder** as the security boundary, not the
+  file mode.
+- **OneDrive / Dropbox / iCloud-synced folders** -- the source may be a
+  dehydrated placeholder. If the provider cannot materialise it, reading raises
+  `OSError`, which is reported as a state error (no backup is claimed). If a
+  sync lock or quota prevents the backup write, the partial `.bak` is removed
+  and the original is left byte-identical.
+
+## 5f. Historical data completeness and the page cap
+
+Every wallet is analysed from two newest-first, paginated feeds:
+
+| Feed | Page size | Requests per wallet | Maximum rows per wallet |
+| --- | --- | --- | --- |
+| `/activity` (fills) | 100 fills | up to `MAX_HISTORY_PAGES` | 3,000 fills at the default (30) |
+| `/closed-positions` | 50 rows | up to `MAX_HISTORY_PAGES` | 1,500 rows at the default (30) |
+
+`MAX_HISTORY_PAGES` (default **30**, `config/settings.py`) is **this project's
+own safety bound on how many pages it is willing to request per feed**. It is
+not a Polymarket API limit and not a property of the data. Polymarket caps the
+*rows per request* (50 for the leaderboard and closed-positions); it does not
+publish a "you may only read 30 pages" rule that this code is obeying. Raising
+`MAX_HISTORY_PAGES` is supported by design.
+
+### How a fetch ends, and what counts as complete
+
+Each feed reports exactly one stop reason:
+
+| Stop reason | Meaning | History |
+| --- | --- | --- |
+| `exhausted` | A **short or empty page** came back: the feed ran out. | **complete** |
+| `page_cap` | The **last permitted page was full**. Older data may exist but was not requested. | **truncated** |
+| `api_error` | A page request failed mid-walk (best-effort fetch). | **truncated** |
+
+A wallet's history is labelled complete only when **both** feeds stopped on a
+short/empty page *and* the refresh itself succeeded. Reaching the cap is never
+reported as complete merely because the fetch loop finished normally.
+
+One deliberate conservative case: a wallet whose history ends **exactly** on
+the cap (for example exactly 1,500 closed positions) is still reported as
+truncated, because the only way to prove otherwise would be an extra request.
+The code errs toward "may be incomplete" rather than claiming completeness it
+cannot demonstrate.
+
+### COMPLETE, PARTIAL and UNKNOWN
+
+These are the three values shown in the scan diagnostics, the dashboard's
+**History** column and `--report`:
+
+- **`COMPLETE`** -- a short/empty page proved the history was fully fetched.
+  Positions, active days and lifetime metrics describe the wallet's whole
+  retrieved history.
+- **`PARTIAL`** -- a page cap (or a failed page) left older data unfetched.
+  `retrieval_status` becomes `PARTIAL` and `data_quality` is written as
+  `PARTIAL` with a sentence naming the endpoint, stop reason, page count and
+  record count, for example:
+  `History is PARTIAL: /closed-positions stopped at the 30-page cap after 1500 row(s) (stop=page_cap); older closed positions are unseen. Active days and lifetime metrics are lower bounds.`
+- **`UNKNOWN`** -- no pagination metadata exists for this wallet. This applies
+  to records scanned before these fields were introduced, to a wallet that has
+  never been scanned, and to a **STALE** refresh (a failed request observed
+  nothing, so it cannot describe completeness). UNKNOWN is never treated as
+  complete.
+
+**API errors.** A failed page during a normal scan is fatal to the refresh:
+the wallet is marked `STALE`, previous metrics/scores are kept unchanged and it
+is excluded from ranking. A failed page during a *best-effort* fetch
+(`raise_on_error=False`, not used by `--scan-wallets`) records `api_error` and
+marks the history truncated instead.
+
+Per-wallet fields written to `data/wallets.json` (when metadata is available):
+`history_truncated`, `activity_truncated`, `closed_positions_truncated`,
+`activity_stop_reason`, `closed_positions_stop_reason`,
+`activity_pages_fetched` / `closed_positions_pages_fetched`,
+`activity_max_pages` / `closed_positions_max_pages`, and
+`activity_rows_fetched` / `closed_positions_rows_fetched`.
+
+### What an incomplete history affects
+
+- **Active days** is a **lower bound**. It counts distinct UTC dates across the
+  `opened_at` / `closed_at` / `resolved_at` timestamps of the positions that
+  were retrieved. A wallet with a busy history beyond the cap can look far less
+  active than it is, and can be rejected for "Only N active days" even though
+  the N is an artefact of the window rather than the wallet.
+- **Lifetime metrics** (ROI, win rate, drawdown, consistency, realized P&L,
+  position counts) describe **the fetched slice, not the wallet's lifetime**.
+  They remain internally correct arithmetic over that slice; they are simply
+  not lifetime figures. `coverage_ratio` and `retrieval_status` record how much
+  of the population was usable.
+- **The resolution-only check** needs SELL fills to recognise a trading exit.
+  If the activity feed was truncated and no exit was observed,
+  `is_resolution_only` is reported as **unknown (`None`)** rather than `True`:
+  absence of evidence is not evidence of absence. The wallet then shows
+  `is_resolution_only` as an inconclusive criterion (`INSUFFICIENT_DATA`)
+  instead of being rejected as "resolution-only". An exit that *is* observed
+  still proves `False`, however truncated the rest of the history is.
+- **What it does *not* affect:** `filter_wallet()` never reads
+  `retrieval_status` or `is_complete_history`, so COMPLETE vs PARTIAL is not
+  itself a pass/fail criterion, and the thresholds are untouched. Truncation
+  is reported, not used as a reason to pass or reject.
+
+### Configuring the cap
+
+```ini
+# .env  (copy .env.example)
+# Pages fetched per feed per wallet. 1 page = 100 /activity fills
+# or 50 /closed-positions rows. Must be >= 1.
+MAX_HISTORY_PAGES=30
+```
+
+At the default this allows up to 3,000 activity fills and 1,500 closed
+positions per wallet.
+
+An unparseable value falls back to **30** and is reported as a `CONFIG ISSUE`
+in the scan diagnostics (see section 5e). The limit in force is also visible
+per wallet in the diagnostics' history lines, which print
+`<pages>/<max_pages>` (for example `exhausted after 3/30 page(s)`); the
+"Configuration in force" block itself lists only the discovery settings
+(`MAX_WALLET_CANDIDATES`, `LEADERBOARD_PAGE_SIZE`, `MAX_LEADERBOARD_PAGES`).
+"Reaching the cap" always means the *effective* value in the running process,
+so check `CONFIG ISSUE` lines and the `/max_pages` figures rather than assuming
+`.env` won.
+
+**Trade-offs of raising it:**
+
+- **Cost is linear in the cap.** Each wallet costs up to
+  `2 x MAX_HISTORY_PAGES` history requests (say 60 at the default, 200 at 100)
+  plus one `/positions` and one `/value` request. For a 100-wallet pool at
+  `MAX_HISTORY_PAGES=100` that is a worst case of ~20,000 requests per scan
+  (most wallets stop early on a short page, so real counts are lower -- the
+  diagnostics and logs report what actually happened).
+- **Rate limiting.** This project does not encode a specific vendor rate limit;
+  it relies on the HTTP client's `MAX_RETRIES` (default 5) retries with
+  exponential backoff plus jitter (base `BACKOFF_BASE`, capped at 30 s) and a
+  short in-memory TTL cache. A larger cap means more requests in a burst, more
+  time per scan, and a higher chance of hitting a transient failure mid-walk --
+  which marks that wallet's history PARTIAL (or STALE for the whole refresh,
+  since `--scan-wallets` treats a failed history page as fatal). Raise it in
+  steps and check the diagnostics rather than jumping straight to a very large
+  value.
+- **Results can change -- honestly.** Raising the cap observes more history, so
+  `active_days`, lifetime metrics and the resolution-only determination can
+  legitimately change for wallets that were previously truncated. That is not a
+  threshold change; it is a more complete measurement. Nothing in this code
+  raises a cap automatically, and no threshold is adjusted to compensate.
 
 ## 6. Run tests
 
@@ -386,6 +591,15 @@ work on this repo should follow.
   so a larger pool means proportionally more API requests per scan. Watch the
   diagnostics' "pages attempted", "rows per page" and `stop reason` to see what
   the pool size is actually buying you.
+- **A wallet's statistics are limited by how much history was fetched.**
+  `MAX_HISTORY_PAGES` (default 30) caps each feed at 3,000 activity fills and
+  1,500 closed positions, newest first. A wallet busy enough to exceed that is
+  labelled `PARTIAL`/truncated, and its `active_days` and lifetime metrics are
+  *lower bounds over the fetched window*, not lifetime figures. It can be
+  rejected for "Only N active days" when N is an artefact of the window. See
+  section 5f for the stop reasons, the `COMPLETE`/`PARTIAL`/`UNKNOWN` statuses,
+  the resolution-only consequence, and the request-cost trade-off of raising
+  the cap.
 - **If a changed setting appears to have no effect**, the diagnostics say why.
   `SCAN DIAGNOSTICS` prints a "Configuration in force" block with each
   discovery setting's *effective value and source* (`.env`, `process

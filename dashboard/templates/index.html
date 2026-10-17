@@ -72,6 +72,9 @@
   .badge-rec { background: rgba(61,220,132,0.18); color: var(--green); border: 1px solid var(--green); }
   .badge-watch2 { background: rgba(255,204,77,0.15); color: var(--yellow); border: 1px solid var(--yellow); }
   .badge-plain { background: rgba(154,164,178,0.15); color: var(--muted); border: 1px solid var(--card-border); }
+  /* PROVISIONAL: a PASS on incomplete history. Deliberately unlike the solid
+     green RECOMMENDED badge and the solid amber WATCH badge: dashed violet. */
+  .badge-provisional { background: rgba(178,142,255,0.14); color: #c9a9ff; border: 1px dashed #b28eff; }
 
   .empty { padding: 24px; text-align: center; color: var(--muted); }
   .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
@@ -93,7 +96,8 @@
     <span class="pill pill-disabled">TRADING: DISABLED</span>
     <span class="muted">Check interval: {{ data.discovery_status.check_interval_seconds }}s &middot;
       Tracked wallets: {{ data.discovery_status.tracked_wallets }} &middot;
-      Discovered wallets: {{ data.discovery_status.discovered_wallets }}</span>
+      Discovered wallets: {{ data.discovery_status.discovered_wallets }} &middot;
+      Provisional: {{ data.discovery_status.provisional_wallets }}</span>
     <a class="refresh-link" href="/">&#8635; Refresh</a>
   </div>
 
@@ -113,10 +117,20 @@
       <div class="card"><div class="label">P&amp;L</div><div class="value {{ 'pos' if t.realized_pnl is not none and t.realized_pnl > 0 else ('neg' if t.realized_pnl is not none and t.realized_pnl < 0 else '') }}">{{ ("+$" if t.realized_pnl > 0 else ("-$" if t.realized_pnl < 0 else "$")) + "%.2f"|format(t.realized_pnl|abs) if t.realized_pnl is not none else "N/A" }}</div></div>
       <div class="card"><div class="label">Drawdown</div><div class="value">{{ "-%.1f"|format(t.drawdown_pct) + "%" if t.drawdown_pct is not none and t.drawdown_pct > 0 else ("0.0%" if t.drawdown_pct == 0 else "N/A") }}</div></div>
       <div class="card"><div class="label">Active Positions</div><div class="value">{{ t.active_positions if t.active_positions is not none else "N/A" }}</div></div>
+      <div class="card"><div class="label">Active Days</div><div class="value">{{ t.active_days if t.active_days is not none else "N/A" }}</div></div>
       <div class="card"><div class="label">Avg Trade Size</div><div class="value">{{ "$%.2f"|format(t.avg_position_size) if t.avg_position_size is not none else "N/A" }}</div></div>
       <div class="card"><div class="label">Last Trade</div><div class="value" style="font-size:14px;">{{ t.last_activity_at or "N/A" }}</div></div>
     </div>
     <p class="note">Data quality: {{ t.data_quality }} -- {{ t.data_quality_reason or "no details available" }}</p>
+    <p class="note">
+      History:
+      {% if t.history_status == "COMPLETE" %}<span class="badge badge-rec" title="{{ t.history_detail }}">COMPLETE</span>
+      {% elif t.history_status == "PARTIAL" %}<span class="badge badge-watch2" title="{{ t.history_detail }}">PARTIAL &mdash; older data not fetched</span>
+      {% else %}<span class="badge badge-plain" title="{{ t.history_detail or 'No pagination metadata stored for this wallet yet.' }}">UNKNOWN</span>{% endif %}
+      {% if t.history_detail %}<span class="muted">{{ t.history_detail }}</span>{% endif %}
+      &mdash; first activity {{ t.first_activity_at or "N/A" }}, last {{ t.last_activity_at or "N/A" }}.
+      {% if t.history_status == "PARTIAL" %}Active days and lifetime metrics are lower bounds over the fetched window.{% endif %}
+    </p>
   {% else %}
     <div class="table-wrap empty">No wallets scanned yet. Run <code>python main.py --scan-wallets</code>.</div>
   {% endif %}
@@ -135,6 +149,7 @@
           <td>{{ "%.1f"|format(w.score) if w.score is not none else "N/A" }}</td>
           <td>
             {% if w.recommendation == "RECOMMENDED" %}<span class="badge badge-rec">RECOMMENDED</span>
+            {% elif w.recommendation == "PROVISIONAL" %}<span class="badge badge-provisional" title="PASS on incomplete history: all thresholds met on the fetched window, but older activity was not fetched.">PROVISIONAL</span>
             {% elif w.recommendation == "WATCH" %}<span class="badge badge-watch2">WATCH</span>
             {% elif w.recommendation == "REJECT" %}<span class="badge badge-reject">REJECT</span>
             {% else %}<span class="badge badge-plain">{{ w.recommendation or "N/A" }}</span>{% endif %}
@@ -158,7 +173,7 @@
     <table>
       <thead><tr>
         <th>Rank</th><th>Wallet</th><th>Score</th><th>Recommendation</th><th>Win Rate</th><th>ROI</th>
-        <th>P&amp;L</th><th>Drawdown</th><th>Positions</th><th>Avg Size</th><th>Risk</th><th>Frequency</th><th>Data Quality</th><th>Tracked?</th>
+        <th>P&amp;L</th><th>Drawdown</th><th>Positions</th><th>Active Days</th><th>Avg Size</th><th>Risk</th><th>Frequency</th><th>Data Quality</th><th>History</th><th>Tracked?</th>
       </tr></thead>
       <tbody>
       {% for w in data.wallet_table %}
@@ -168,6 +183,7 @@
           <td>{{ "%.1f"|format(w.score) if w.score is not none else "N/A" }}</td>
           <td>
             {% if w.recommendation == "RECOMMENDED" %}<span class="badge badge-rec">RECOMMENDED</span>
+            {% elif w.recommendation == "PROVISIONAL" %}<span class="badge badge-provisional" title="PASS on incomplete history: all thresholds met on the fetched window, but older activity was not fetched.">PROVISIONAL</span>
             {% elif w.recommendation == "WATCH" %}<span class="badge badge-watch2">WATCH</span>
             {% elif w.recommendation == "REJECT" %}<span class="badge badge-reject">REJECT</span>
             {% else %}<span class="badge badge-plain">{{ w.recommendation or "N/A" }}</span>{% endif %}
@@ -181,6 +197,7 @@
           </td>
           <td>{{ "-%.1f"|format(w.drawdown_pct) + "%" if w.drawdown_pct is not none and w.drawdown_pct > 0 else ("0.0%" if w.drawdown_pct == 0 else "N/A") }}</td>
           <td>{{ w.num_positions if w.num_positions is not none else "N/A" }}</td>
+          <td title="{{ 'Distinct UTC dates across opened/closed/resolved timestamps' if w.active_days is not none else 'Not computed for this wallet yet (run a scan)' }}">{{ w.active_days if w.active_days is not none else "N/A" }}</td>
           <td>{{ "$%.2f"|format(w.avg_position_size) if w.avg_position_size is not none else "N/A" }}</td>
           <td>{{ "%.1f"|format(w.risk_score) if w.risk_score is not none else "N/A" }}</td>
           <td>
@@ -202,6 +219,12 @@
             {% elif w.data_quality == "STALE" %}<span class="badge badge-reject" title="{{ w.data_quality_reason }}">Stale -- refresh failed</span>
             {% else %}<span class="badge badge-plain" title="{{ w.data_quality_reason }}">Insufficient data</span>{% endif %}
           </td>
+          <td>
+            {% if w.history_status == "COMPLETE" %}<span class="badge badge-rec" title="{{ w.history_detail or 'History ended on a short/empty page.' }}">COMPLETE</span>
+            {% elif w.history_status == "PARTIAL" %}<span class="badge badge-watch2" title="{{ w.history_detail or 'Older history was not fetched.' }}{% if w.history_note %} — {{ w.history_note }}{% endif %}">PARTIAL</span>
+            {% else %}<span class="badge badge-plain" title="{{ w.history_detail or 'No pagination metadata stored for this wallet yet.' }}">UNKNOWN</span>{% endif %}
+            {% if w.indeterminate_criteria %}<span class="muted" title="Criteria a truncated window cannot decide">indeterminate: {{ w.indeterminate_criteria|join(", ") }}</span>{% endif %}
+          </td>
           <td>{{ "Yes" if w.tracked else "No" }}</td>
         </tr>
       {% endfor %}
@@ -211,6 +234,7 @@
     <div class="empty">No wallets scanned yet. Run <code>python main.py --scan-wallets</code>.</div>
   {% endif %}
   </div>
+  <p class="note"><strong>Reading this table:</strong> <em>N/A</em> means the value is not available or was never computed for this wallet (e.g. a stale refresh, or no scan since the field was introduced); <em>0</em> is a genuine measured zero. <em>PROVISIONAL</em> is a PASS computed on a PARTIAL history: every threshold is met on the fetched window, but older activity was not fetched, so it is never shown as RECOMMENDED. <em>History</em> shows whether the scan proved it had fetched the whole history: <strong>COMPLETE</strong> = it ended on a short/empty page, <strong>PARTIAL</strong> = a page cap (or failed request) left older data unfetched, so positions/active days/lifetime metrics are lower bounds. Hover a badge for endpoint, stop reason, page and record counts.</p>
   <p class="note">This is the scanned/ranked candidate pool, not the set of wallets being tracked. Only wallets marked "Tracked: Yes" above (and listed in the Tracked Wallets section) are ever polled by <code>--track-wallets</code>.</p>
 
   <!-- ============ RECENT WALLET ACTIVITY ============ -->
