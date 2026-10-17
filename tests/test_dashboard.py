@@ -162,11 +162,11 @@ def test_dashboard_has_no_order_or_control_routes():
         assert "DELETE" not in methods
 
 
-def test_dashboard_handles_corrupted_json_files(tmp_path, monkeypatch):
-    """The dashboard must load gracefully with 200 OK even if on-disk JSON
-    data files are corrupted, truncated, or contain non-JSON bytes."""
+def test_dashboard_handles_corrupted_non_wallet_json_files(tmp_path, monkeypatch):
+    """Non-critical JSON files stay lenient: a corrupt verification or
+    activity log must not take the dashboard down. (The wallet-state file is
+    deliberately strict -- see tests/test_wallet_state_integrity.py.)"""
     _isolate_data_files(monkeypatch, tmp_path)
-    (tmp_path / "wallets.json").write_text("{corrupted json", encoding="utf-8")
     (tmp_path / "verification.json").write_text("invalid", encoding="utf-8")
     (tmp_path / "wallet_activity_log.json").write_text("[truncated", encoding="utf-8")
 
@@ -228,10 +228,11 @@ def test_dashboard_rejects_non_get_methods(tmp_path, monkeypatch):
 
 
 def test_dashboard_renders_with_non_dict_json_data(tmp_path, monkeypatch):
-    """Confirm dashboard handles valid JSON files that contain unexpected root
-    types (e.g. integer or string instead of dict/list) without crashing."""
+    """Non-critical JSON files may hold unexpected root types (integer,
+    string, boolean) without crashing the dashboard. The wallet file is
+    valid-but-empty here; an invalid wallet file is a hard error by design."""
     _isolate_data_files(monkeypatch, tmp_path)
-    (tmp_path / "wallets.json").write_text('"not a list of wallets"', encoding="utf-8")
+    (tmp_path / "wallets.json").write_text("[]", encoding="utf-8")
     (tmp_path / "verification.json").write_text("12345", encoding="utf-8")
     (tmp_path / "wallet_activity_log.json").write_text("true", encoding="utf-8")
 

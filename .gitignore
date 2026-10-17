@@ -5,6 +5,7 @@ __pycache__/
 data/*.json
 !data/wallets.json
 data/*.log
+data/*.bak
 reports/*.json
 reports/*.csv
 .pytest_cache/

@@ -28,6 +28,13 @@ from typing import Any, Optional
 import requests
 
 from config.settings import settings
+from polymarket.pagination import (
+    STOP_API_ERROR,
+    STOP_EXHAUSTED,
+    STOP_PAGE_CAP,
+    PagedRecords,
+    PaginationInfo,
+)
 
 logger = logging.getLogger("polymarket.api_client")
 
@@ -247,10 +254,19 @@ class PolymarketApiClient:
         page_size: int = 50,
         sort_by: str = "TIMESTAMP",
         sort_direction: str = "DESC",
+        raise_on_error: bool = False,
     ) -> list[dict]:
         """
         Retrieve the wallet's full closed-position history across up to
         `max_pages` pages (Phase 12).
+
+        `raise_on_error=False` (default) keeps the historical best-effort
+        behaviour: a failing page ends pagination and whatever was already
+        collected is returned. Pass ``raise_on_error=True`` to surface the
+        failure as an ``ApiError`` instead, so callers can distinguish "the
+        history is empty" from "the request failed" -- Phase B's stale-data
+        handling needs that distinction and must never treat a failed
+        request as fresh (empty) data.
 
         Uses offset-based pagination.  Stops early when a page returns fewer
         records than page_size (no more data) or when max_pages is reached
@@ -261,10 +277,17 @@ class PolymarketApiClient:
         the /activity endpoint's implicit newest-first ordering so that the
         sell-event detection in build_position_records() can correctly
         attribute TRADING_EXIT settlement types.
+
+        Returns ``PagedRecords`` (a list subclass): a full final page at the
+        page cap is reported as ``truncated`` because older closed positions
+        may exist beyond it. Only a short/empty page proves completeness.
         """
         max_pages = max(1, max_pages)
         all_records: list[dict] = []
         seen: set[tuple] = set()
+        pages_fetched = 0
+        rows_fetched = 0
+        stop_reason = STOP_EXHAUSTED
 
         for page in range(max_pages):
             offset = page * page_size
@@ -273,9 +296,23 @@ class PolymarketApiClient:
                     wallet, limit=page_size, offset=offset,
                     sort_by=sort_by, sort_direction=sort_direction,
                 )
-            except Exception:
+            except ApiError:
+                if raise_on_error:
+                    raise
+                stop_reason = STOP_API_ERROR
                 break
+            except Exception as exc:
+                if raise_on_error:
+                    raise ApiError(
+                        f"closed-positions pagination failed for wallet={wallet} offset={offset}: {exc}"
+                    ) from exc
+                stop_reason = STOP_API_ERROR
+                break
+
+            pages_fetched += 1
+            rows_fetched += len(page_data)
             if not page_data:
+                stop_reason = STOP_EXHAUSTED
                 break
             for r in page_data:
                 key = (r.get("conditionId"), r.get("asset"))
@@ -284,9 +321,25 @@ class PolymarketApiClient:
                     all_records.append(r)
             if len(page_data) < page_size:
                 # Fewer records than requested — we have reached the end.
+                stop_reason = STOP_EXHAUSTED
                 break
+            if page == max_pages - 1:
+                # A full page on the last permitted request: more history may
+                # exist, but fetching it would exceed the configured cap.
+                stop_reason = STOP_PAGE_CAP
 
-        return all_records
+        return PagedRecords(
+            all_records,
+            PaginationInfo(
+                endpoint="/closed-positions",
+                pages_fetched=pages_fetched,
+                page_size=page_size,
+                max_pages=max_pages,
+                rows_fetched=rows_fetched,
+                unique_rows=len(all_records),
+                stop_reason=stop_reason,
+            ),
+        )
 
     def get_leaderboard(
         self, category: str = "OVERALL", time_period: str = "MONTH",

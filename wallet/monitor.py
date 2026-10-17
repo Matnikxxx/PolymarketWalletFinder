@@ -32,7 +32,7 @@ from analytics.frequency import RollingWindowTracker
 from polymarket.api_client import PolymarketApiClient
 from polymarket.market_client import get_market_info
 from polymarket.wallet_activity import dedupe_new_events, fetch_wallet_events
-from storage import load_json, save_json_atomic
+from storage import load_json, load_wallet_state, save_json_atomic
 
 logger = logging.getLogger("wallet.monitor")
 
@@ -48,20 +48,134 @@ def _parse_event_ts(ts: Optional[str]) -> Optional[datetime]:
 
 def load_wallet_config(path: Optional[Path] = None) -> list[dict]:
     """
+    Load the persisted wallet records.
+
     `path` defaults to `settings.WALLETS_FILE`, resolved at CALL time (not
     import time) -- a plain `path: Path = settings.WALLETS_FILE` default
     would bake in whatever WALLETS_FILE was when this module was first
     imported, so changing settings.WALLETS_FILE later (e.g. in tests via
     monkeypatch) would silently have no effect.
+
+    Strict on purpose: a missing file means "no wallets yet", but a file
+    that exists and cannot be parsed raises ``WalletStateError`` (after a
+    byte-identical backup is written) instead of masquerading as empty.
+    Returning ``[]`` here would let the next scan overwrite tracked flags,
+    notes and records.
     """
-    data = load_json(path if path is not None else settings.WALLETS_FILE, default=[])
-    if not isinstance(data, list):
-        return []
-    return [w for w in data if isinstance(w, dict)]
+    return load_wallet_state(path if path is not None else settings.WALLETS_FILE)
 
 
 def save_wallet_config(wallets: list[dict], path: Optional[Path] = None) -> None:
-    save_json_atomic(path if path is not None else settings.WALLETS_FILE, wallets)
+    target = path if path is not None else settings.WALLETS_FILE
+    # Defence in depth: never replace an existing file that cannot be parsed.
+    # The scan loads state before doing any work, but this guard also covers
+    # any future caller (and a file corrupted between load and save).
+    if Path(target).exists():
+        load_wallet_state(target)
+    save_json_atomic(target, wallets)
+
+
+def wallet_address_key(value) -> str:
+    """
+    Stable, case-insensitive lookup key for a wallet address.
+
+    Accepts either a config record ({"wallet": "0x..."}) or a bare address
+    string. Returns "" when no usable address is present, so callers can
+    skip malformed entries instead of raising. Address casing must never
+    create a second record for the same wallet.
+    """
+    if isinstance(value, dict):
+        value = value.get("wallet")
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def merge_wallet_records(existing_records: list[dict], scanned_records: list[dict]) -> list[dict]:
+    """
+    Merge freshly scanned wallet records into the previously stored ones
+    without losing user state (Phase B, section B).
+
+    Guarantees:
+      * Matching is case-insensitive on the normalized address, so an address
+        stored as mixed case is updated, not duplicated.
+      * Scanned fields are applied on top of the stored record, so custom
+        fields a user added by hand survive a re-scan.
+      * The stored ``tracked`` preference always wins; the legacy ``enabled``
+        field is honored when ``tracked`` is absent and is replaced by
+        ``tracked`` on write (see CLAUDE.md's migration rule).
+      * Stored wallets that were NOT rediscovered are retained, unchanged, in
+        their original order -- a scan never deletes a wallet just because it
+        dropped off the leaderboard.
+      * Output order is deterministic: scanned order first, then retained
+        wallets in their previously stored order.
+    """
+    existing_by_key: dict[str, dict] = {}
+    existing_order: list[str] = []
+
+    for record in existing_records or []:
+        if not isinstance(record, dict):
+            logger.warning("WALLET_CONFIG_INVALID_ENTRY_SKIPPED type=%s", type(record).__name__)
+            continue
+        key = wallet_address_key(record)
+        if not key:
+            logger.warning("WALLET_CONFIG_ENTRY_WITHOUT_ADDRESS_SKIPPED")
+            continue
+        if key in existing_by_key:
+            # Same wallet stored twice with different casing: collapse into
+            # the first entry, keeping any field it is missing, and never
+            # losing a tracking selection.
+            base = existing_by_key[key]
+            for name, value in record.items():
+                if name != "wallet" and name not in base:
+                    base[name] = value
+            if is_wallet_tracked(record) and not is_wallet_tracked(base):
+                base["tracked"] = True
+            logger.warning("WALLET_CONFIG_DUPLICATE_ADDRESS_COLLAPSED wallet=%s", key)
+            continue
+        existing_by_key[key] = dict(record)
+        existing_order.append(key)
+
+    merged: list[dict] = []
+    handled: set[str] = set()
+
+    for scanned in scanned_records or []:
+        if not isinstance(scanned, dict):
+            logger.warning("WALLET_SCAN_INVALID_ENTRY_SKIPPED type=%s", type(scanned).__name__)
+            continue
+        key = wallet_address_key(scanned)
+        if not key:
+            logger.warning("WALLET_SCAN_ENTRY_WITHOUT_ADDRESS_SKIPPED")
+            continue
+        if key in handled:
+            continue
+        handled.add(key)
+
+        previous = existing_by_key.get(key)
+        if previous is None:
+            record = dict(scanned)
+            tracked = is_wallet_tracked(scanned)
+        else:
+            record = dict(previous)          # keeps custom fields + history
+            tracked = is_wallet_tracked(previous)  # user's selection wins
+            record.update(scanned)           # fresh scan values overwrite stale ones
+
+        address = scanned.get("wallet")
+        if isinstance(address, str) and address.strip():
+            record["wallet"] = address.strip().lower()
+        elif previous is not None:
+            record["wallet"] = previous.get("wallet", key)
+
+        record.pop("enabled", None)          # legacy field, superseded by `tracked`
+        record["tracked"] = bool(tracked)
+        merged.append(record)
+
+    for key in existing_order:
+        if key in handled:
+            continue
+        merged.append(dict(existing_by_key[key]))   # untouched, unchanged
+
+    return merged
 
 
 def is_wallet_tracked(wallet: dict) -> bool:

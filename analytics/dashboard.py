@@ -62,6 +62,47 @@ def _recent_activity(limit: int) -> list[dict]:
     return rows
 
 
+def _history_status(w: dict) -> str:
+    """
+    COMPLETE / PARTIAL / UNKNOWN for a stored wallet record (P4).
+
+    ``history_truncated`` is written by the scan from pagination metadata:
+    True when a page cap (or failed request) left older history unfetched.
+    A record from before this field existed -- or one never refreshed -- has
+    no value at all, and "unknown" is the honest answer; it must never be
+    rendered as complete.
+    """
+    flag = w.get("history_truncated")
+    if flag is True:
+        return "PARTIAL"
+    if flag is False:
+        return "COMPLETE"
+    return "UNKNOWN"
+
+
+def _history_detail(w: dict) -> str:
+    """Per-endpoint tooltip text: endpoint, stop reason, pages, records."""
+    parts = []
+    for endpoint, prefix in (
+        ("/activity", "activity"),
+        ("/closed-positions", "closed_positions"),
+    ):
+        stop = w.get(f"{prefix}_stop_reason")
+        pages = w.get(f"{prefix}_pages_fetched")
+        max_pages = w.get(f"{prefix}_max_pages")
+        rows = w.get(f"{prefix}_rows_fetched")
+        if stop is None and pages is None and rows is None:
+            continue
+        page_text = "?" if pages is None else str(pages)
+        if max_pages is not None:
+            page_text = f"{page_text}/{max_pages}"
+        parts.append(
+            f"{endpoint}: {stop or 'unknown'} after {page_text} page(s), "
+            f"{'?' if rows is None else rows} record(s) fetched"
+        )
+    return "; ".join(parts)
+
+
 def _wallet_row(w: dict, verification: dict) -> dict:
     wallet = w["wallet"]
     v = verification.get(wallet, {}) if isinstance(verification, dict) else {}
@@ -101,7 +142,23 @@ def _wallet_row(w: dict, verification: dict) -> dict:
         "largest_trade": w.get("largest_trade"),
         "active_positions": w.get("active_positions"),
         "portfolio_value": w.get("portfolio_value"),
+        # --- Activity span + history completeness (P4) --------------------
+        # active_days / first_activity_at are None when the scan never
+        # computed them; 0 is a real measured value and is preserved as 0.
+        "active_days": w.get("active_days"),
+        "first_activity_at": w.get("first_activity_at"),
         "last_activity_at": w.get("last_activity_at"),
+        "history_status": _history_status(w),
+        "history_detail": _history_detail(w),
+        # D2/D3: why a PARTIAL history changed (or did not change) the
+        # decision, and which criteria it left undecidable. Persisted verbatim
+        # from wallets.json so later refreshes and the dashboard agree.
+        "history_note": w.get("history_note"),
+        "indeterminate_criteria": list(w.get("hard_filter_indeterminate_criteria") or []),
+        "activity_pages_fetched": w.get("activity_pages_fetched"),
+        "closed_positions_pages_fetched": w.get("closed_positions_pages_fetched"),
+        "activity_stop_reason": w.get("activity_stop_reason"),
+        "closed_positions_stop_reason": w.get("closed_positions_stop_reason"),
     }
 
 
@@ -138,13 +195,23 @@ def build_dashboard_data(recent_activity_limit: int = 20) -> DashboardData:
     wallets_cfg = load_wallet_config()
     active = tracked_wallets(wallets_cfg)
 
+    wallet_table = _wallet_table()
+    history_counts = {"COMPLETE": 0, "PARTIAL": 0, "UNKNOWN": 0}
+    provisional_wallets = 0
+    for row in wallet_table:
+        history_counts[row["history_status"]] = history_counts.get(row["history_status"], 0) + 1
+        if row.get("recommendation") == "PROVISIONAL":
+            provisional_wallets += 1
+
     discovery_status = {
         "check_interval_seconds": settings.CHECK_INTERVAL,
         "tracked_wallets": len(active),
         "discovered_wallets": len(wallets_cfg),
+        "history_complete": history_counts["COMPLETE"],
+        "history_partial": history_counts["PARTIAL"],
+        "history_unknown": history_counts["UNKNOWN"],
+        "provisional_wallets": provisional_wallets,
     }
-
-    wallet_table = _wallet_table()
 
     return DashboardData(
         discovery_status=discovery_status,

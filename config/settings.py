@@ -10,38 +10,166 @@ copy-trading, or bankroll settings.
 """
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
+
+logger = logging.getLogger("config.settings")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 REPORTS_DIR = BASE_DIR / "reports"
+ENV_FILE = BASE_DIR / ".env"
 
-load_dotenv(BASE_DIR / ".env")
+# `override=False` (the python-dotenv default) means a value already present in
+# the process environment WINS over .env. That is deliberate -- an explicit
+# shell/CI variable should beat a local file -- but it is also the single most
+# confusing way to "change a setting and see nothing happen", so every
+# conflict and every unparseable value is recorded in CONFIG_ISSUES below and
+# surfaced in the scan diagnostics.
+load_dotenv(ENV_FILE)
 
 
-def _bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
+def _env_file_values() -> dict:
+    """Values declared in .env (empty dict when there is no readable .env)."""
+    try:
+        values = dotenv_values(ENV_FILE) or {}
+    except Exception:  # unreadable/malformed .env must never crash startup
+        return {}
+    return {key: value for key, value in values.items() if value is not None}
+
+
+_ENV_FILE_VALUES: dict = _env_file_values()
+
+#: Human-readable notes about configuration that did not apply as written.
+#: Read by monitor/scan_report.py so the user sees them without hunting logs.
+CONFIG_ISSUES: list[str] = []
+
+
+def setting_source(name: str) -> str:
+    """
+    Where the EFFECTIVE value of `name` came from: ".env", "process
+    environment" or "default".
+
+    This is what makes "I changed .env but nothing changed" answerable at a
+    glance instead of guessable.
+    """
+    effective = os.environ.get(name)
+    if effective is None:
+        return "default"
+    from_file = _ENV_FILE_VALUES.get(name)
+    if from_file is not None and str(from_file).strip() == str(effective).strip():
+        return ".env"
+    return "process environment"
+
+
+def _clean_env_value(raw: str) -> str:
+    """
+    Tolerate the ways people actually write values in a .env file:
+    surrounding whitespace, 'quotes', and a trailing inline comment.
+    """
+    value = str(raw).strip()
+    if "#" in value:
+        value = value.split("#", 1)[0].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
+def _record_issue(name: str, raw: str, default, kind: str, source: str) -> None:
+    message = (
+        f"{name}={raw[:40]!r} (from {source}) is not a valid {kind}; "
+        f"falling back to the default {default!r}."
+    )
+    if message not in CONFIG_ISSUES:
+        CONFIG_ISSUES.append(message)
+    logger.warning("CONFIG_VALUE_INVALID %s", message)
+
+
+def _check_env_shadowing(name: str) -> None:
+    """Record when a process-environment value is overriding .env."""
+    from_file = _ENV_FILE_VALUES.get(name)
+    if from_file is None:
+        return
+    effective = os.environ.get(name)
+    if effective is not None and str(from_file).strip() != str(effective).strip():
+        message = (
+            f"{name}: .env says {from_file.strip()!r} but the process environment sets "
+            f"{effective.strip()!r}, which wins (edit the environment or unset it to use .env)."
+        )
+        if message not in CONFIG_ISSUES:
+            CONFIG_ISSUES.append(message)
+        logger.warning("CONFIG_ENV_OVERRIDES_ENV_FILE %s", message)
+
+
+def _raw(name: str, default, kind: str):
+    """Raw string value for `name`, or None when it is unset. Records shadowing."""
+    _check_env_shadowing(name)
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    return raw
+
+
+def parse_bool(name: str, default: bool) -> bool:
+    raw = _raw(name, default, "boolean")
+    if raw is None:
         return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
+    value = _clean_env_value(raw).lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off", ""):
+        return False
+    _record_issue(name, raw, default, "boolean (use true/false)", setting_source(name))
+    return default
+
+
+def parse_float(name: str, default: float) -> float:
+    raw = _raw(name, default, "number")
+    if raw is None:
+        return default
+    value = _clean_env_value(raw)
+    try:
+        return float(value)
+    except ValueError:
+        _record_issue(name, raw, default, "number", setting_source(name))
+        return default
+
+
+def parse_int(name: str, default: int) -> int:
+    raw = _raw(name, default, "integer")
+    if raw is None:
+        return default
+    value = _clean_env_value(raw)
+    try:
+        return int(value)
+    except ValueError:
+        # Tolerate a plain decimal that happens to be a whole number ("100.0"),
+        # but not scientific/exponent forms ("1e2") -- those are far more
+        # likely to be a misunderstanding than an intentional 100.
+        if "." in value:
+            try:
+                as_float = float(value)
+            except ValueError:
+                as_float = None
+            if as_float is not None and as_float.is_integer():
+                return int(as_float)
+        _record_issue(name, raw, default, "integer", setting_source(name))
+        return default
+
+
+# Backwards-compatible private aliases (the Settings class below uses these).
+def _bool(name: str, default: bool) -> bool:
+    return parse_bool(name, default)
 
 
 def _float(name: str, default: float) -> float:
-    val = os.getenv(name)
-    try:
-        return float(val) if val is not None else default
-    except ValueError:
-        return default
+    return parse_float(name, default)
 
 
 def _int(name: str, default: int) -> int:
-    val = os.getenv(name)
-    try:
-        return int(val) if val is not None else default
-    except ValueError:
-        return default
+    return parse_int(name, default)
 
 
 class Settings:
@@ -63,12 +191,22 @@ class Settings:
     BREAKEVEN_TOLERANCE_USDC: float = _float("BREAKEVEN_TOLERANCE_USDC", 0.01)
 
     # ---- WALLET DISCOVERY -----------------------------------------------
-    # How many candidate wallets the scanner will consider. The current
-    # scanner (wallet/scanner.py) can only source ~20 from the public
-    # leaderboard + seed list, so this is currently a soft cap on that --
-    # but pulling it into config means a future scanner that can paginate
-    # to a larger universe doesn't require touching this constant.
+    # Hard cap on the number of distinct candidate wallets a single scan
+    # will consider. The cap applies to the UNION of leaderboard-sourced
+    # candidates and the seed list (see wallet/scanner.py::scan_top_wallets).
     MAX_WALLET_CANDIDATES: int = _int("MAX_WALLET_CANDIDATES", 30)
+    # Leaderboard pagination (Phase B). The scanner walks the public
+    # leaderboard with limit/offset pages, requesting LEADERBOARD_PAGE_SIZE
+    # rows per page for at most MAX_LEADERBOARD_PAGES requests. 50 is the
+    # server-side maximum page size (Polymarket caps `limit` at 50), so any
+    # larger configured value is clamped down to 50 by the scanner.
+    # Pagination always stops early on an empty page, a short page, a
+    # repeated page, an API error, or once MAX_WALLET_CANDIDATES is filled.
+    LEADERBOARD_PAGE_SIZE: int = _int("LEADERBOARD_PAGE_SIZE", 50)
+    MAX_LEADERBOARD_PAGES: int = _int("MAX_LEADERBOARD_PAGES", 10)
+    # Hard ceiling enforced by the scanner regardless of configuration
+    # (mirrors Polymarket's documented per-request cap).
+    LEADERBOARD_MAX_PAGE_SIZE: int = 50
 
     # ---- HISTORICAL DATA COLLECTION (Phase 12 / 15) ----------------------
     # Maximum number of pages to retrieve for /activity and /closed-positions

@@ -231,7 +231,9 @@ class WalletStatistics:
     # --- Hard-Filter Criteria (Phase 8B) ---
     # is_resolution_only: True  → wallet never exits via trading sells (resolution-only).
     #                     False → wallet has at least one trading-exit position.
-    #                     None  → cannot be determined (insufficient position history).
+    #                     None  → cannot be determined (insufficient position history,
+    #                             or the SELL history was truncated so an exit may
+    #                             exist in the unfetched window).
     # Logic mirrors legacy wallet_stats.py: is_resolution_only when no positions have
     # settlement_type == TRADING_EXIT and total ordinary positions >= 3.
     is_resolution_only: Optional[bool] = None

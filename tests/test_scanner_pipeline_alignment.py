@@ -313,7 +313,7 @@ def test_cmd_scan_wallets_multi_partitioning(
     mock_client = MagicMock()
     mock_client_cls.return_value = mock_client
 
-    def side_effect_events(client, wallet, max_pages=5):
+    def side_effect_events(client, wallet, max_pages=5, **_kwargs):
         if wallet == w_pass:
             return [
                 {
@@ -345,7 +345,7 @@ def test_cmd_scan_wallets_multi_partitioning(
     mock_events.side_effect = side_effect_events
 
     # cmd_scan_wallets now calls get_wallet_closed_positions_paginated (Phase 12).
-    def side_effect_closed_paginated(wallet, max_pages=5):
+    def side_effect_closed_paginated(wallet, max_pages=5, **_kwargs):
         if wallet == w_pass:
             return [
                 {
@@ -384,7 +384,7 @@ def test_cmd_scan_wallets_multi_partitioning(
 
     orig_compute_stats = main.compute_wallet_statistics
 
-    def mocked_compute_stats(wallet, positions):
+    def mocked_compute_stats(wallet, positions, **kwargs):
         if wallet == w_insuf:
             return WalletStatistics(
                 wallet=w_insuf,
@@ -398,7 +398,7 @@ def test_cmd_scan_wallets_multi_partitioning(
                 is_resolution_only=None,  # triggers INSUFFICIENT_DATA
                 category_mix={"Crypto": 45},
             )
-        return orig_compute_stats(wallet, positions)
+        return orig_compute_stats(wallet, positions, **kwargs)
 
     with patch("main.compute_wallet_statistics", side_effect=mocked_compute_stats):
         with patch("main.load_wallet_config", return_value=[]):

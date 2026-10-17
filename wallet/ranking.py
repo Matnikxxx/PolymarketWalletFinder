@@ -13,6 +13,7 @@ from typing import Optional, Union
 
 from analytics.frequency import FrequencyStats
 from analytics.frequency_models import FrequencyProfile
+from analytics.consistency import consistency_score_from_dispersion
 from analytics.models import WalletStatistics
 from analytics.wallet_stats import WalletStats
 from config.settings import settings
@@ -55,16 +56,9 @@ def _extract_wallet_inputs(stats: Union[WalletStatistics, WalletStats]):
         # Consistency score
         consistency = getattr(stats, "consistency_score", None)
         if consistency is None:
-            m = stats.consistency_mean_roi
-            sd = stats.consistency_stdev_roi
-            if m is not None and sd is not None:
-                if m != 0:
-                    cv = abs(sd / m)
-                    consistency = max(0.0, min(10.0, 10.0 / (1.0 + cv)))
-                else:
-                    consistency = 0.0
-            else:
-                consistency = None
+            consistency = consistency_score_from_dispersion(
+                stats.consistency_mean_roi, stats.consistency_stdev_roi
+            )
 
         has_dispersion_history = consistency is not None
         dispersion_count = stats.positions_counted

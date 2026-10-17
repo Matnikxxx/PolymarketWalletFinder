@@ -31,6 +31,53 @@ wallets the user explicitly chooses to track.
 - For compatibility, old configuration entries with `enabled` are still read when
   `tracked` is absent. New writes should use `tracked`.
 - Do not discard existing user selections or history during migrations.
+- `--scan-wallets` merges into the stored config (case-insensitive address
+  matching, custom fields and `tracked` preserved, undiscovered wallets kept);
+  it must never rebuild the file from scratch.
+- Discovery pagination: `LEADERBOARD_PAGE_SIZE` (max 50) and
+  `MAX_LEADERBOARD_PAGES` bound the leaderboard walk; `MAX_WALLET_CANDIDATES`
+  caps the combined leaderboard + seed pool.
+- Stale-data rule: a failed refresh must never overwrite stored metrics or
+  scores. It sets `data_quality="STALE"`, `hard_filter_status="STALE"`, updates
+  `last_refresh_attempt`, leaves `last_successful_refresh` untouched, and bars
+  the wallet from ranking. A *successful empty* response is not stale.
+- Discovery must keep the seed list reachable: the leaderboard walk is bounded
+  by `MAX_WALLET_CANDIDATES - len(seeds)` whenever the cap can hold the whole
+  seed list, so a scan never rediscovers a leaderboard-only pool.
+- Every scanned candidate records `first_seen_at`/`last_seen_at`/`times_seen`/
+  `discovery_source`; a wallet that is only rediscovered keeps its metrics.
+- `monitor/scan_report.py` aggregates diagnostics read-only: it must never
+  recompute metrics, re-run filters, re-rank, or alter thresholds, and it must
+  state that frequency penalties affect the score, not ranking eligibility.
+- Do not lower hard-filter thresholds or add leaderboard rotation to raise the
+  PASS count. Report the rejection-reason counts and leave the decision to the
+  user.
+- A short leaderboard page must never end discovery (it usually means the
+  server clipped the page, not that the data ran out). Empty page, repeated
+  page, page cap, budget and API errors are the authoritative stops.
+- Config values must never fail silently: unparseable values fall back to the
+  default AND are recorded in `config.settings.CONFIG_ISSUES`, which the scan
+  diagnostics print. An exported variable overriding `.env` is reported too
+  (python-dotenv's `override=False` is deliberate; do not flip it without
+  saying so).
+- `MAX_HISTORY_PAGES` (default 30) bounds each history feed: 100 fills per
+  activity page, 50 rows per closed-positions page. It is our own safety bound,
+  never describe it as a Polymarket API limit.
+- History completeness must be derived from *how the fetch ended*, not from the
+  loop finishing: a short/empty page (`exhausted`) proves completeness; a full
+  final page at the cap (`page_cap`) or a failed best-effort page
+  (`api_error`) means truncated. Pass this through as
+  `compute_wallet_statistics(is_complete_history=...)` so a truncated wallet is
+  `PARTIAL`, never `SUFFICIENT`.
+- Missing evidence is not negative evidence: when the exit history is
+  incomplete, `is_resolution_only` must be `None` (unknown), never `True`. An
+  observed `TRADING_EXIT` still proves `False`.
+- Completeness is reporting metadata, not a filter input: `filter_wallet()` must
+  not read `retrieval_status`/`is_complete_history`, and a cap must never be
+  raised automatically to make a wallet qualify.
+- The dashboard/report must distinguish a genuine zero (e.g. `active_days: 0`)
+  from an unknown value (`None` -> `N/A`), and must show legacy records with no
+  metadata as `UNKNOWN` rather than assuming completeness.
 - Do not commit `.env`, credentials, local logs, or user data.
 
 ## Change workflow

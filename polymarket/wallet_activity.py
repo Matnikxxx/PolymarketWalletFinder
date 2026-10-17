@@ -8,6 +8,13 @@ import hashlib
 from typing import Iterable
 
 from polymarket.api_client import PolymarketApiClient, ApiError
+from polymarket.pagination import (
+    STOP_API_ERROR,
+    STOP_EXHAUSTED,
+    STOP_PAGE_CAP,
+    PagedRecords,
+    PaginationInfo,
+)
 from polymarket.parsers import normalize_activity_event
 
 
@@ -76,6 +83,7 @@ def fetch_wallet_events_paginated(
     wallet: str,
     max_pages: int = 5,
     page_size: int = 100,
+    raise_on_error: bool = False,
 ) -> list[dict]:
     """
     Fetch and normalize a wallet's complete TRADE activity across up to
@@ -88,23 +96,48 @@ def fetch_wallet_events_paginated(
     Returns events sorted oldest-first (ascending timestamp), deduplicated
     by event_id so that duplicate fills from overlapping page windows never
     produce duplicate PositionRecords downstream.
+
+    `raise_on_error=False` (default) keeps the historical best-effort
+    behaviour: a failed page ends pagination and the events collected so far
+    are returned. Pass ``raise_on_error=True`` to surface the failure as an
+    ``ApiError`` instead, so callers can distinguish "no activity" from "the
+    request failed" (Phase B stale-data handling).
+
+    Returns ``PagedRecords`` (a list subclass). ``pagination.truncated`` is
+    True when the last permitted page was full (older fills may exist) or when
+    a best-effort fetch stopped on an API error. A short or empty page is the
+    only evidence that the history is complete.
     """
-    from config.settings import settings
     max_pages = max(1, max_pages)
 
     all_raw: list[dict] = []
+    pages_fetched = 0
+    rows_fetched = 0
+    stop_reason = STOP_EXHAUSTED
     for page in range(max_pages):
         offset = page * page_size
         try:
             raw_page = client.get_wallet_activity(wallet, limit=page_size, offset=offset)
         except ApiError:
+            if raise_on_error:
+                raise
+            stop_reason = STOP_API_ERROR
             break
         if not raw_page:
+            pages_fetched += 1
+            stop_reason = STOP_EXHAUSTED
             break
+        pages_fetched += 1
+        rows_fetched += len(raw_page)
         all_raw.extend(raw_page)
         if len(raw_page) < page_size:
             # Last page — no more records available.
+            stop_reason = STOP_EXHAUSTED
             break
+        if page == max_pages - 1:
+            # A full page on the last permitted request: older fills may
+            # exist, but fetching them would exceed the configured cap.
+            stop_reason = STOP_PAGE_CAP
 
     seen_ids: set[str] = set()
     events: list[dict] = []
@@ -124,7 +157,18 @@ def fetch_wallet_events_paginated(
 
     # Oldest first so processing order matches chronological order.
     events.sort(key=lambda e: e.get("timestamp") or "")
-    return events
+    return PagedRecords(
+        events,
+        PaginationInfo(
+            endpoint="/activity",
+            pages_fetched=pages_fetched,
+            page_size=page_size,
+            max_pages=max_pages,
+            rows_fetched=rows_fetched,
+            unique_rows=len(events),
+            stop_reason=stop_reason,
+        ),
+    )
 
 
 def dedupe_new_events(events: Iterable[dict], seen_ids: set[str]) -> list[dict]:
